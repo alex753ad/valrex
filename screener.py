@@ -1,5 +1,8 @@
 """
-Crypto Screener v3 — Binance Futures → Telegram
+Crypto Screener v4 — 3-слойная архитектура
+  Слой 1: Быстрое обнаружение объём-спайков (каждые 10 сек)
+  Слой 2: Слежение за уровнями активных монет (каждые 15-30 сек)
+  Слой 3: Оценка и алерт (мгновенно при касании уровня)
 """
 
 import os
@@ -20,38 +23,63 @@ from matplotlib.patches import Rectangle
 # ─────────────────────────────────────────────
 #  НАСТРОЙКИ
 # ─────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL_ID  = os.environ.get("TELEGRAM_CHANNEL_ID", "")
+TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID", "")
 
-NATR_MIN             = 0.8
-VOLUME_5M_MIN        = 400_000
-RESEND_CHANGE_PCT    = 20
-RESEND_MIN_INTERVAL  = 1000
+# Слой 1
+LAYER1_INTERVAL     = 10       # сек между сканами
+VOLUME_SPIKE_A      = 3.0      # триггер А: умеренный спайк
+VOLUME_SPIKE_B      = 5.0      # триггер Б: сильный спайк
+VOLUME_SPIKE_C      = 8.0      # триггер В: экстремальный спайк
+ACTIVE_TTL          = 600      # сек — сколько монета остаётся активной
 
-PRICE_CHANGE_PCT     = 2.0
-PRICE_RESEND_SEC     = 300
+# Слой 2
+LAYER2_INTERVAL_NORMAL = 30    # сек, режим NORMAL
+LAYER2_INTERVAL_HOT    = 20    # сек, режим HOT
+LAYER2_INTERVAL_WILD   = 15    # сек, режим WILD
+MAX_TOUCHES         = 3        # касаний до сброса
+FLAT_CANDLES        = 10       # свечей для определения флэта
 
-VOLUME_SPIKE_MULT    = 3.0
-LEVEL_PROXIMITY_PCT  = 1.0
-IMPULSE_MAX_MIN      = 30
-MIN_SIGNAL_STARS     = 2
+# NATR-режимы
+NATR_HOT            = 1.5      # % — переход в HOT
+NATR_WILD           = 3.0      # % — переход в WILD
 
-SCAN_INTERVAL_SEC    = 60
-MAX_WORKERS          = 20
+# Радиус близости к уровню (по режиму)
+RADIUS_NORMAL       = 0.5      # %
+RADIUS_HOT          = 0.8      # %
+RADIUS_WILD         = 1.5      # %
 
-BINANCE_BASE = "https://fapi.binance.com"
+# Слой 3
+MIN_STARS           = 2
+ORDER_BOOK_DEPTH    = 20
+
+MAX_WORKERS         = 20
+BINANCE_BASE        = "https://fapi.binance.com"
+
+# ─────────────────────────────────────────────
+#  ГЛОБАЛЬНОЕ СОСТОЯНИЕ
 # ─────────────────────────────────────────────
 
-signal_cache_1: dict = {}
-signal_cache_2: dict = {}
-cache_lock = threading.Lock()
-proxy_lock = threading.Lock()
+# { symbol: { "since": timestamp, "impulse_price": float,
+#             "vol_mult": float, "touches": int,
+#             "levels": [...], "last_alert": timestamp } }
+active_coins: dict = {}
+active_lock  = threading.Lock()
 
-# ── ПРОКСИ ────────────────────────────────────
+# Кэш последних алертов для дедупликации
+alert_cache: dict  = {}
+alert_lock   = threading.Lock()
 
-PROXY_LIST = []
+proxy_lock   = threading.Lock()
 current_proxy = {"http": None, "https": None}
+PROXY_LIST: list = []
 
+http_session = requests.Session()
+http_session.headers.update({"User-Agent": "CryptoScreener/4.0"})
+
+# ─────────────────────────────────────────────
+#  ПРОКСИ
+# ─────────────────────────────────────────────
 
 def fetch_free_proxies():
     global PROXY_LIST
@@ -64,22 +92,21 @@ def fetch_free_proxies():
         try:
             r = requests.get(url, timeout=10)
             if r.status_code == 200:
-                lines = r.text.strip().split("\n")
-                for line in lines:
+                for line in r.text.strip().split("\n"):
                     line = line.strip()
                     if line and ":" in line:
                         proxies.append(line)
         except Exception as e:
             print(f"  [PROXY FETCH ERR] {e}")
     random.shuffle(proxies)
-    PROXY_LIST = proxies[:100]
-    print(f"  [PROXY] Загружено прокси: {len(PROXY_LIST)}")
+    PROXY_LIST = proxies[:150]
+    print(f"  [PROXY] Загружено: {len(PROXY_LIST)}")
 
 
 def test_proxy(proxy_str):
     proxy = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
     try:
-        r = requests.get(f"{BINANCE_BASE}/fapi/v1/ping", proxies=proxy, timeout=8)
+        r = requests.get(f"{BINANCE_BASE}/fapi/v1/ping", proxies=proxy, timeout=6)
         return r.status_code == 200
     except Exception:
         return False
@@ -87,17 +114,14 @@ def test_proxy(proxy_str):
 
 def find_working_proxy():
     global current_proxy
-    print("  [PROXY] Ищу рабочий прокси для Binance...")
-    for proxy_str in PROXY_LIST:
-        if test_proxy(proxy_str):
+    print("  [PROXY] Ищу рабочий прокси...")
+    for p in PROXY_LIST:
+        if test_proxy(p):
             with proxy_lock:
-                current_proxy = {
-                    "http": f"http://{proxy_str}",
-                    "https": f"http://{proxy_str}"
-                }
-            print(f"  [PROXY] ✅ Рабочий прокси: {proxy_str}")
+                current_proxy = {"http": f"http://{p}", "https": f"http://{p}"}
+            print(f"  [PROXY] ✅ {p}")
             return True
-    print("  [PROXY] ❌ Рабочий прокси не найден, работаю без прокси")
+    print("  [PROXY] ❌ Не найден, работаю без прокси")
     with proxy_lock:
         current_proxy = {"http": None, "https": None}
     return False
@@ -108,559 +132,678 @@ def refresh_proxies():
     find_working_proxy()
 
 
-# ── HTTP ──────────────────────────────────────
+# ─────────────────────────────────────────────
+#  HTTP
+# ─────────────────────────────────────────────
 
-http = requests.Session()
-http.headers.update({"User-Agent": "CryptoScreener/3.0"})
-
-
-def fetch(url, params=None):
+def fetch(url, params=None, timeout=8):
     with proxy_lock:
         proxy = dict(current_proxy)
     try:
-        r = http.get(url, params=params, timeout=10, proxies=proxy)
+        r = http_session.get(url, params=params, timeout=timeout, proxies=proxy)
         if r.status_code == 200:
             return r.json()
-        elif r.status_code == 451:
-            print("  [PROXY] Binance заблокировал IP, меняю прокси...")
+        if r.status_code == 451:
             threading.Thread(target=find_working_proxy, daemon=True).start()
     except Exception as e:
         print(f"  [HTTP ERR] {e}")
     return None
 
 
+# ─────────────────────────────────────────────
+#  УТИЛИТЫ
+# ─────────────────────────────────────────────
+
+def fmt_vol(v):
+    if v >= 1_000_000: return f"{v/1_000_000:.1f}M"
+    if v >= 1_000:     return f"{v/1_000:.1f}k"
+    return str(int(v))
+
+def fmt_usd(v):
+    if v >= 1_000_000: return f"${v/1_000_000:.1f}M"
+    if v >= 1_000:     return f"${v/1_000:.0f}k"
+    return f"${v:.0f}"
+
+def stars_str(n):
+    n = max(0, min(5, int(n)))
+    return "⭐" * n + "☆" * (5 - n)
+
+def natr_mode(natr):
+    if natr >= NATR_WILD:  return "WILD"
+    if natr >= NATR_HOT:   return "HOT"
+    return "NORMAL"
+
+def radius_for_mode(mode):
+    return {"NORMAL": RADIUS_NORMAL, "HOT": RADIUS_HOT, "WILD": RADIUS_WILD}[mode]
+
+def layer2_interval(mode):
+    return {"NORMAL": LAYER2_INTERVAL_NORMAL,
+            "HOT":    LAYER2_INTERVAL_HOT,
+            "WILD":   LAYER2_INTERVAL_WILD}[mode]
+
+
+# ─────────────────────────────────────────────
+#  ИНДИКАТОРЫ
+# ─────────────────────────────────────────────
+
 def calc_atr(candles, period=14):
     if len(candles) < period + 1:
         return 0.0
     trs = []
     for i in range(1, len(candles)):
-        h  = float(candles[i][2])
-        l  = float(candles[i][3])
-        pc = float(candles[i-1][4])
+        h, l, pc = float(candles[i][2]), float(candles[i][3]), float(candles[i-1][4])
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
     return sum(trs[-period:]) / period
 
-
-def calc_natr(atr, close):
+def calc_natr(candles):
+    close = float(candles[-1][4])
+    atr   = calc_atr(candles)
     return round(atr / close * 100, 2) if close else 0.0
 
+def ema(data, period):
+    k = 2 / (period + 1)
+    result = [sum(data[:period]) / period]
+    for p in data[period:]:
+        result.append(p * k + result[-1] * (1 - k))
+    return result
 
-def format_volume(v):
-    if v >= 1_000_000:
-        return f"{v/1_000_000:.1f}M"
-    if v >= 1_000:
-        return f"{v/1_000:.1f}k"
-    return str(int(v))
-
-
-def format_dollar(v):
-    if v >= 1_000_000:
-        return f"${v/1_000_000:.1f}M"
-    if v >= 1_000:
-        return f"${v/1_000:.0f}k"
-    return f"${v:.0f}"
-
-
-# ── УРОВНИ ────────────────────────────────────
-
-def find_levels_for_tf(candles, tf_label, min_touches=2):
-    highs  = [float(c[2]) for c in candles]
-    lows   = [float(c[3]) for c in candles]
-    pivot_highs = []
-    pivot_lows  = []
-    wing = 2
-    for i in range(wing, len(candles) - wing):
-        if highs[i] >= max(highs[i-wing:i] + highs[i+1:i+wing+1]):
-            pivot_highs.append(highs[i])
-        if lows[i] <= min(lows[i-wing:i] + lows[i+1:i+wing+1]):
-            pivot_lows.append(lows[i])
-
-    def cluster(points, pct=0.3):
-        if not points:
-            return []
-        points = sorted(points)
-        clusters = []
-        group = [points[0]]
-        for p in points[1:]:
-            if (p - group[0]) / group[0] * 100 < pct:
-                group.append(p)
-            else:
-                clusters.append(group)
-                group = [p]
-        clusters.append(group)
-        return [(sum(g)/len(g), len(g)) for g in clusters if len(g) >= min_touches]
-
-    levels = []
-    for price, touches in cluster(pivot_highs):
-        levels.append({"price": price, "touches": touches, "type": "res", "tf": tf_label})
-    for price, touches in cluster(pivot_lows):
-        levels.append({"price": price, "touches": touches, "type": "sup", "tf": tf_label})
-    return levels
-
-
-def find_all_levels(symbol, k1):
-    all_levels = []
-    all_levels += find_levels_for_tf(k1[-100:], "1m")
-    k5 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-               {"symbol": symbol, "interval": "5m", "limit": 100})
-    if k5:
-        all_levels += find_levels_for_tf(k5, "5m")
-    k15 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                {"symbol": symbol, "interval": "15m", "limit": 100})
-    if k15:
-        all_levels += find_levels_for_tf(k15, "15m")
-    return all_levels
-
-
-def nearest_level(close, levels):
-    if not levels:
-        return None, None
-    best = min(levels, key=lambda l: abs(l["price"] - close))
-    dist_pct = abs(best["price"] - close) / close * 100
-    return best, round(dist_pct, 2)
-
-
-def is_near_level(close, levels):
-    level, dist = nearest_level(close, levels)
-    if level is None:
-        return False, None, None
-    return dist <= LEVEL_PROXIMITY_PCT, level, dist
-
-
-# ── ПАТТЕРНЫ ──────────────────────────────────
-
-def detect_pattern(candles):
-    if len(candles) < 3:
-        return None, None
-    c  = candles[-1]
-    c1 = candles[-2]
-    o,  h,  l,  cl  = float(c[1]),  float(c[2]),  float(c[3]),  float(c[4])
-    o1, h1, l1, cl1 = float(c1[1]), float(c1[2]), float(c1[3]), float(c1[4])
-    body = abs(cl - o)
-    full_rng = h - l if h != l else 0.0001
-    upper_shadow = h - max(o, cl)
-    lower_shadow = min(o, cl) - l
-    if lower_shadow >= body * 2 and lower_shadow >= upper_shadow * 2:
-        return "🔨 Молот", "bull"
-    if upper_shadow >= body * 2 and upper_shadow >= lower_shadow * 2:
-        return "🔨 Перев. молот", "bear"
-    if body / full_rng < 0.1:
-        return "➕ Доджи", None
-    if cl1 < o1 and cl > o and o <= cl1 and cl >= o1:
-        return "🟢 Бычье поглощение", "bull"
-    if cl1 > o1 and cl < o and o >= cl1 and cl <= o1:
-        return "🔴 Медв. поглощение", "bear"
-    if cl > o and body / full_rng > 0.7:
-        return "📗 Сильная бычья", "bull"
-    if cl < o and body / full_rng > 0.7:
-        return "📕 Сильная медвежья", "bear"
-    return None, None
-
-
-def get_trend_15m(symbol):
-    k = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-              {"symbol": symbol, "interval": "15m", "limit": 55})
-    if not k or len(k) < 52:
+def get_trend(candles_15m):
+    if not candles_15m or len(candles_15m) < 52:
         return "flat"
-    closes = [float(c[4]) for c in k]
-    def ema(data, period):
-        kf = 2 / (period + 1)
-        result = [sum(data[:period]) / period]
-        for price in data[period:]:
-            result.append(price * kf + result[-1] * (1 - kf))
-        return result
-    ema20 = ema(closes, 20)[-1]
-    ema50 = ema(closes, 50)[-1]
-    close = closes[-1]
-    if close > ema20 > ema50:
-        return "bull"
-    if close < ema20 < ema50:
-        return "bear"
+    closes = [float(c[4]) for c in candles_15m]
+    e20 = ema(closes, 20)[-1]
+    e50 = ema(closes, 50)[-1]
+    c   = closes[-1]
+    if c > e20 > e50: return "bull"
+    if c < e20 < e50: return "bear"
     return "flat"
 
-
-def volume_spike(k5_long):
-    if not k5_long or len(k5_long) < 14:
-        return 0, 0
-    recent_vol = float(k5_long[-2][7])
-    avg_vol    = sum(float(c[7]) for c in k5_long[-14:-2]) / 12
-    mult = round(recent_vol / avg_vol, 1) if avg_vol > 0 else 0
-    return recent_vol, mult
-
-
 def calc_cvd(candles, lookback=20):
-    data = candles[-lookback:]
-    cvd = []
-    running = 0
+    data, running, cvd = candles[-lookback:], 0, []
     for c in data:
         o, cl, vol = float(c[1]), float(c[4]), float(c[5])
         running += vol if cl >= o else -vol
         cvd.append(running)
-    if len(cvd) < 5:
+    if len(cvd) < 3: return "neutral"
+    r = cvd[-3:]
+    if r[-1] > r[-2] > r[-3]: return "up"
+    if r[-1] < r[-2] < r[-3]: return "down"
+    return "neutral"
+
+def volume_mult(candles_5m, lookback=12):
+    """Возвращает (последний_объём, множитель)"""
+    if not candles_5m or len(candles_5m) < lookback + 2:
+        return 0, 0
+    recent = float(candles_5m[-2][7])
+    avg    = sum(float(c[7]) for c in candles_5m[-lookback-2:-2]) / lookback
+    return recent, round(recent / avg, 1) if avg > 0 else 0
+
+def is_flat(candles_1m, n=FLAT_CANDLES):
+    """Флэт: последние n свечей укладываются в диапазон < 0.5% от цены"""
+    if len(candles_1m) < n:
+        return False
+    data   = candles_1m[-n:]
+    highs  = [float(c[2]) for c in data]
+    lows   = [float(c[3]) for c in data]
+    rng    = max(highs) - min(lows)
+    mid    = (max(highs) + min(lows)) / 2
+    return (rng / mid * 100) < 0.5 if mid else False
+
+def detect_pattern(candles):
+    if len(candles) < 2: return None, None
+    c, c1 = candles[-1], candles[-2]
+    o,  h,  l,  cl  = float(c[1]),  float(c[2]),  float(c[3]),  float(c[4])
+    o1, h1, l1, cl1 = float(c1[1]), float(c1[2]), float(c1[3]), float(c1[4])
+    body     = abs(cl - o)
+    full_rng = h - l if h != l else 0.0001
+    us = h - max(o, cl)
+    ls = min(o, cl) - l
+    if ls >= body * 2 and ls >= us * 2:           return "🔨 Молот",              "bull"
+    if us >= body * 2 and us >= ls * 2:           return "🔨 Перев. молот",       "bear"
+    if body / full_rng < 0.1:                     return "➕ Доджи",              None
+    if cl1 < o1 and cl > o and o <= cl1 and cl >= o1: return "🟢 Бычье поглощение", "bull"
+    if cl1 > o1 and cl < o and o >= cl1 and cl <= o1: return "🔴 Медв. поглощение", "bear"
+    if cl > o and body / full_rng > 0.7:          return "📗 Сильная бычья",      "bull"
+    if cl < o and body / full_rng > 0.7:          return "📕 Сильная медвежья",   "bear"
+    return None, None
+
+
+# ─────────────────────────────────────────────
+#  УРОВНИ
+# ─────────────────────────────────────────────
+
+def find_pivots(candles, tf_label, min_touches=2):
+    highs = [float(c[2]) for c in candles]
+    lows  = [float(c[3]) for c in candles]
+    ph, pl = [], []
+    wing = 2
+    for i in range(wing, len(candles) - wing):
+        if highs[i] >= max(highs[i-wing:i] + highs[i+1:i+wing+1]):
+            ph.append(highs[i])
+        if lows[i] <= min(lows[i-wing:i] + lows[i+1:i+wing+1]):
+            pl.append(lows[i])
+
+    def cluster(pts, pct=0.3):
+        if not pts: return []
+        pts = sorted(pts)
+        groups, g = [], [pts[0]]
+        for p in pts[1:]:
+            if (p - g[0]) / g[0] * 100 < pct:
+                g.append(p)
+            else:
+                groups.append(g); g = [p]
+        groups.append(g)
+        return [(sum(g)/len(g), len(g)) for g in groups if len(g) >= min_touches]
+
+    levels = []
+    for price, touches in cluster(ph):
+        levels.append({"price": price, "touches": touches, "type": "res", "tf": tf_label})
+    for price, touches in cluster(pl):
+        levels.append({"price": price, "touches": touches, "type": "sup", "tf": tf_label})
+    return levels
+
+def collect_levels(symbol, k1):
+    levels = find_pivots(k1[-100:], "1m")
+    k5  = fetch(f"{BINANCE_BASE}/fapi/v1/klines", {"symbol": symbol, "interval": "5m",  "limit": 100})
+    k15 = fetch(f"{BINANCE_BASE}/fapi/v1/klines", {"symbol": symbol, "interval": "15m", "limit": 100})
+    if k5:  levels += find_pivots(k5,  "5m")
+    if k15: levels += find_pivots(k15, "15m")
+    return levels
+
+def nearest_level(close, levels):
+    if not levels: return None, None
+    best = min(levels, key=lambda l: abs(l["price"] - close))
+    return best, round(abs(best["price"] - close) / close * 100, 2)
+
+def near_any_level(close, levels, radius_pct):
+    for lv in levels:
+        dist = abs(lv["price"] - close) / close * 100
+        if dist <= radius_pct:
+            return True, lv, round(dist, 2)
+    return False, None, None
+
+
+# ─────────────────────────────────────────────
+#  СТАКАН
+# ─────────────────────────────────────────────
+
+def get_order_book_pressure(symbol, avg_vol):
+    """Возвращает 'buy' / 'sell' / 'neutral' на основе стакана."""
+    data = fetch(f"{BINANCE_BASE}/fapi/v1/depth",
+                 {"symbol": symbol, "limit": ORDER_BOOK_DEPTH})
+    if not data:
         return "neutral"
-    recent = cvd[-3:]
-    if recent[-1] > recent[-2] > recent[-3]:
-        return "up"
-    if recent[-1] < recent[-2] < recent[-3]:
-        return "down"
+    bid_vol = sum(float(b[1]) for b in data.get("bids", []))
+    ask_vol = sum(float(a[1]) for a in data.get("asks", []))
+    total   = bid_vol + ask_vol
+    if total == 0:
+        return "neutral"
+    ratio = bid_vol / total
+    if ratio > 0.6:   return "buy"
+    if ratio < 0.4:   return "sell"
     return "neutral"
 
 
-def minutes_since_impulse(candles, threshold_pct=1.5):
-    for i in range(len(candles) - 1, max(0, len(candles) - 60), -1):
-        c = candles[i]
-        o, cl = float(c[1]), float(c[4])
-        if o > 0 and abs(cl - o) / o * 100 >= threshold_pct:
-            return len(candles) - 1 - i
-    return 999
+# ─────────────────────────────────────────────
+#  РЕЙТИНГ
+# ─────────────────────────────────────────────
 
-
-def calc_stars(near_level, pattern_dir, signal_dir, trend, vol_mult, cvd, impulse_min):
-    score = 1
-    if near_level:
-        score += 1
-    if pattern_dir and pattern_dir == signal_dir:
-        score += 1
-    if (signal_dir == "bull" and trend == "bull") or \
-       (signal_dir == "bear" and trend == "bear"):
-        score += 0.5
-    if vol_mult >= VOLUME_SPIKE_MULT:
-        score += 1
-    if (signal_dir == "bull" and cvd == "up") or \
-       (signal_dir == "bear" and cvd == "down"):
-        score += 0.5
-    if impulse_min <= IMPULSE_MAX_MIN:
-        score += 0.5
+def calc_stars(near_level, pat_dir, sig_dir, trend, vol_mult_val,
+               cvd, touch_num, ob_pressure, mode):
+    score = 1.0
+    if near_level:                                    score += 1.0
+    if pat_dir and pat_dir == sig_dir:                score += 1.0
+    if (sig_dir == "bull" and trend == "bull") or \
+       (sig_dir == "bear" and trend == "bear"):       score += 0.5
+    if vol_mult_val >= VOLUME_SPIKE_C:                score += 1.0
+    elif vol_mult_val >= VOLUME_SPIKE_B:              score += 0.5
+    if (sig_dir == "bull" and cvd == "up") or \
+       (sig_dir == "bear" and cvd == "down"):         score += 0.5
+    if touch_num == 2:                                score += 0.5   # 2е касание
+    if touch_num >= 3:                                score += 1.0   # 3е касание
+    if (sig_dir == "bull" and ob_pressure == "buy") or \
+       (sig_dir == "bear" and ob_pressure == "sell"): score += 0.5
+    if mode == "WILD":                                score += 0.5
     return min(5, round(score))
 
 
-def stars_str(n):
-    return "⭐" * n + "☆" * (5 - n)
-
-
-# ── ДЕДУПЛИКАЦИЯ ──────────────────────────────
-
-def should_send_s1(symbol, natr):
-    now = time.time()
-    with cache_lock:
-        prev = signal_cache_1.get(symbol)
-        if prev is None:
-            signal_cache_1[symbol] = {"natr": natr, "last_sent": now}
-            return True
-        time_ok    = (now - prev["last_sent"]) >= RESEND_MIN_INTERVAL
-        change_pct = abs(natr - prev["natr"]) / prev["natr"] * 100 if prev["natr"] else 100
-        if time_ok or change_pct >= RESEND_CHANGE_PCT:
-            signal_cache_1[symbol] = {"natr": natr, "last_sent": now}
-            return True
-    return False
-
-
-def should_send_s2(symbol):
-    now = time.time()
-    with cache_lock:
-        last = signal_cache_2.get(symbol, 0)
-        if (now - last) >= PRICE_RESEND_SEC:
-            signal_cache_2[symbol] = now
-            return True
-    return False
-
-
-# ── ГРАФИК ────────────────────────────────────
+# ─────────────────────────────────────────────
+#  TELEGRAM
+# ─────────────────────────────────────────────
 
 TF_COLORS = {
     "sup": {"1m": "#00e5ff", "5m": "#00ff99", "15m": "#ffff00"},
-    "res": {"1m": "#ff4444", "5m": "#ff8800", "15m": "#ff44ff"}
+    "res": {"1m": "#ff4444", "5m": "#ff8800", "15m": "#ff44ff"},
 }
-
 
 def build_chart(symbol, candles, levels=None):
     try:
-        data = candles[-60:]
-        n = len(data)
-        opens   = [float(c[1]) for c in data]
-        highs   = [float(c[2]) for c in data]
-        lows    = [float(c[3]) for c in data]
-        closes  = [float(c[4]) for c in data]
-        dollar_vols = [float(c[7]) for c in data]
-        times   = [datetime.utcfromtimestamp(int(c[0]) / 1000) for c in data]
+        data   = candles[-60:]
+        n      = len(data)
+        opens  = [float(c[1]) for c in data]
+        highs  = [float(c[2]) for c in data]
+        lows   = [float(c[3]) for c in data]
+        closes = [float(c[4]) for c in data]
+        dvols  = [float(c[7]) for c in data]
+        times  = [datetime.utcfromtimestamp(int(c[0])/1000) for c in data]
 
-        fig, (ax1, ax2) = plt.subplots(
-            2, 1, figsize=(13, 8),
-            gridspec_kw={"height_ratios": [3, 1]},
-            facecolor="#0d1117"
-        )
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 8),
+                                        gridspec_kw={"height_ratios": [3, 1]},
+                                        facecolor="#0d1117")
         ax1.set_facecolor("#0d1117")
         ax2.set_facecolor("#0d1117")
-
         w = 0.6
         for i in range(n):
             color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
-            ax1.plot([i, i], [lows[i], highs[i]], color=color, linewidth=0.8)
-            body_h = abs(closes[i] - opens[i]) or (highs[i] - lows[i]) * 0.01
-            body_y = min(opens[i], closes[i])
-            ax1.add_patch(Rectangle((i - w/2, body_y), w, body_h,
+            ax1.plot([i, i], [lows[i], highs[i]], color=color, lw=0.8)
+            bh = abs(closes[i]-opens[i]) or (highs[i]-lows[i])*0.01
+            ax1.add_patch(Rectangle((i-w/2, min(opens[i], closes[i])), w, bh,
                                      facecolor=color, edgecolor=color))
+            ax2.bar(i, dvols[i], color=color, width=w, alpha=0.85)
 
         if levels:
-            price_min = min(lows)
-            price_max = max(highs)
-            margin = (price_max - price_min) * 0.15
-            visible = [lv for lv in levels
-                       if price_min - margin <= lv["price"] <= price_max + margin]
-            seen = []
-            deduped = []
+            pmn, pmx = min(lows), max(highs)
+            margin = (pmx - pmn) * 0.15
+            visible = [lv for lv in levels if pmn-margin <= lv["price"] <= pmx+margin]
+            seen, deduped = [], []
             for lv in sorted(visible, key=lambda x: x["price"]):
-                too_close = any(abs(lv["price"] - s) / s * 100 < 0.2 for s in seen)
-                if not too_close:
-                    deduped.append(lv)
-                    seen.append(lv["price"])
-            for lv in deduped[:10]:
-                tf  = lv["tf"]
-                typ = lv["type"]
-                color = TF_COLORS.get(typ, {}).get(tf, "#ffffff")
-                lw    = 1.5 if tf == "15m" else 1.0
-                ls    = "-" if tf == "15m" else "--"
-                ax1.axhline(y=lv["price"], color=color, linewidth=lw,
-                            linestyle=ls, alpha=0.9, zorder=5)
-                label = f" {lv['price']:.6g}  [{tf}] ×{lv['touches']}"
-                ax1.text(n - 0.5, lv["price"], label, color=color, fontsize=7,
-                         va="center", fontweight="bold",
+                if not any(abs(lv["price"]-s)/s*100 < 0.2 for s in seen):
+                    deduped.append(lv); seen.append(lv["price"])
+            for lv in deduped[:12]:
+                color = TF_COLORS.get(lv["type"], {}).get(lv["tf"], "#fff")
+                lw = 1.5 if lv["tf"] == "15m" else 1.0
+                ls = "-"  if lv["tf"] == "15m" else "--"
+                ax1.axhline(y=lv["price"], color=color, lw=lw, ls=ls, alpha=0.9, zorder=5)
+                ax1.text(n-0.5, lv["price"],
+                         f" {lv['price']:.6g} [{lv['tf']}] ×{lv['touches']}",
+                         color=color, fontsize=7, va="center", fontweight="bold",
                          bbox=dict(facecolor="#0d1117", alpha=0.6, pad=1, edgecolor="none"))
 
-            from matplotlib.lines import Line2D
-            legend_items = []
-            for tf, tc in [("1m", "#00e5ff"), ("5m", "#00ff99"), ("15m", "#ffff00")]:
-                legend_items.append(Line2D([0], [0], color=tc, lw=1.2, label=f"Sup {tf}"))
-            for tf, tc in [("1m", "#ff4444"), ("5m", "#ff8800"), ("15m", "#ff44ff")]:
-                legend_items.append(Line2D([0], [0], color=tc, lw=1.2, label=f"Res {tf}"))
-            ax1.legend(handles=legend_items, loc="upper left", fontsize=6, ncol=2,
-                       facecolor="#161b22", edgecolor="#30363d",
-                       labelcolor="white", framealpha=0.8)
-
-        for i in range(n):
-            color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
-            ax2.bar(i, dollar_vols[i], color=color, width=w, alpha=0.85)
-
-        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: format_dollar(x)))
-        tick_idx = list(range(0, n, max(1, n // 6)))
+        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: fmt_usd(x)))
+        ticks = list(range(0, n, max(1, n//6)))
         for ax in [ax1, ax2]:
-            ax.set_xticks(tick_idx)
-            ax.set_xticklabels([times[i].strftime("%H:%M") for i in tick_idx],
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([times[i].strftime("%H:%M") for i in ticks],
                                 color="#8b949e", fontsize=8)
             ax.tick_params(colors="#8b949e", labelsize=8)
             ax.yaxis.set_tick_params(labelcolor="#8b949e")
-            for spine in ax.spines.values():
-                spine.set_edgecolor("#30363d")
-            ax.grid(color="#21262d", linestyle="--", linewidth=0.5)
+            for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
+            ax.grid(color="#21262d", ls="--", lw=0.5)
             ax.set_xlim(-1, n)
-
-        ax1.set_title(f"{symbol} (1m свечи)", color="#e6edf3",
-                      fontsize=13, fontweight="bold", pad=10)
+        ax1.set_title(f"{symbol} · 1m", color="#e6edf3", fontsize=13, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
-        ax2.set_ylabel("Volume (USD)", color="#8b949e", fontsize=9)
-
+        ax2.set_ylabel("Vol USD",  color="#8b949e", fontsize=9)
         plt.tight_layout(pad=1.2)
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
-        plt.close(fig)
-        buf.seek(0)
+        plt.close(fig); buf.seek(0)
         return buf.read()
     except Exception as e:
         print(f"  [CHART ERR {symbol}] {e}")
         return None
 
-
-# ── ПОДПИСИ ───────────────────────────────────
-
-def trend_emoji(t):
-    return {"bull": "▲ бычий", "bear": "▼ медвежий", "flat": "➡ флэт"}.get(t, "➡ флэт")
-
-
-def cvd_emoji(c):
-    return {"up": "↑ растёт", "down": "↓ падает", "neutral": "→ нейтрально"}.get(c, "→")
-
-
-def level_line(level, dist_pct):
-    if not level or dist_pct is None:
-        return None
-    ltype = "поддержка" if level["type"] == "sup" else "сопротивление"
-    return (f"📍 Уровень [{level['tf']}] ({ltype}): "
-            f"<b>{level['price']:.6g}</b> "
-            f"(×{level['touches']}) — <b>{dist_pct}%</b>")
-
-
-def build_caption(header, symbol, main_line, natr, volume_5m, vol_mult,
-                  level, dist_pct, pattern_name, trend, cvd, impulse_min, stars):
-    coin = symbol.replace("USDT", "")
-    lines = [
-        f"{header}  {stars_str(stars)}",
-        "━━━━━━━━━━━━━━━",
-        f"🟨 Тикер: <b>{symbol}</b>",
-        main_line,
-        f"📈 Natr (1 мин): <b>{natr}%</b>",
-        f"💰 Объём (5 мин): <b>{format_volume(volume_5m)}</b>",
-    ]
-    if vol_mult >= 1.5:
-        lines.append(f"🔥 Всплеск объёма: <b>×{vol_mult}</b> от среднего")
-    ll = level_line(level, dist_pct)
-    if ll:
-        lines.append(ll)
-    if pattern_name:
-        lines.append(f"🕯 Паттерн: <b>{pattern_name}</b>")
-    lines.append(f"📊 Тренд 15m: <b>{trend_emoji(trend)}</b>")
-    lines.append(f"📉 CVD дельта: <b>{cvd_emoji(cvd)}</b>")
-    if impulse_min < 999:
-        lines.append(f"⏱ Импульс: <b>{impulse_min} мин назад</b>")
-    lines.append(f"\n💎 Монета: <b>{coin}</b>")
-    return "\n".join(lines)
-
-
-# ── TELEGRAM ──────────────────────────────────
-
 def send_photo(image_bytes, caption):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
-        r = requests.post(url, data={
-            "chat_id": TELEGRAM_CHANNEL_ID,
-            "caption": caption,
-            "parse_mode": "HTML"
-        }, files={"photo": ("chart.png", image_bytes, "image/png")}, timeout=20)
+        r = requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID,
+                                     "caption": caption, "parse_mode": "HTML"},
+                          files={"photo": ("chart.png", image_bytes, "image/png")}, timeout=20)
         if not r.json().get("ok"):
-            print(f"  [TG ERROR] {r.json()}")
+            print(f"  [TG ERR] {r.json()}")
     except Exception as e:
-        print(f"  [TG EXCEPTION] {e}")
-
+        print(f"  [TG EXC] {e}")
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHANNEL_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }, timeout=10)
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHANNEL_ID,
+                                     "text": text, "parse_mode": "HTML"}, timeout=10)
         if not r.json().get("ok"):
-            print(f"  [TG ERROR] {r.json()}")
+            print(f"  [TG ERR] {r.json()}")
     except Exception as e:
-        print(f"  [TG EXCEPTION] {e}")
+        print(f"  [TG EXC] {e}")
 
 
-# ── СКАНИРОВАНИЕ ─────────────────────────────
+# ─────────────────────────────────────────────
+#  ПОСТРОЕНИЕ СООБЩЕНИЙ
+# ─────────────────────────────────────────────
 
-def get_symbols():
+def _trend_str(t):
+    return {"bull": "▲ бычий", "bear": "▼ медвежий", "flat": "➡ флэт"}.get(t, "➡ флэт")
+
+def _cvd_str(c):
+    return {"up": "↑ покупатели активны", "down": "↓ продавцы активны",
+            "neutral": "→ нейтрально"}.get(c, "→")
+
+def _ob_str(o):
+    return {"buy": "📗 перевес покупателей", "sell": "📕 перевес продавцов",
+            "neutral": "⚖️ нейтрально"}.get(o, "⚖️")
+
+def _mode_label(mode):
+    return {"NORMAL": "нормальная волатильность",
+            "HOT":    "повышенная волатильность",
+            "WILD":   "ДИКАЯ ВОЛАТИЛЬНОСТЬ"}[mode]
+
+def build_layer1_alert(symbol, vol_mult_val, trigger):
+    """Быстрый алерт Слоя 1."""
+    trigger_labels = {
+        "A": f"объём {vol_mult_val:.1f}x",
+        "B": f"🔥 сильный объём {vol_mult_val:.1f}x",
+        "C": f"💥 экстремальный объём {vol_mult_val:.1f}x",
+    }
+    return (f"🔥 <b>{symbol}</b> активен · {trigger_labels.get(trigger, '')} · смотри\n"
+            f"<i>Слой 1 — жду касания уровня...</i>")
+
+def build_layer3_alert(symbol, close, level, dist_pct, natr, vol_mult_val,
+                       cvd, pattern_name, trend, ob_pressure,
+                       touch_num, stars, mode, candles_count):
+    coin = symbol.replace("USDT", "")
+    ltype = "поддержка" if level["type"] == "sup" else "сопротивление"
+
+    if mode == "WILD":
+        header = f"⚡️ WILD · <b>{symbol}</b> · {stars_str(stars)}"
+        mode_line = f"Режим: <b>ДИКАЯ ВОЛАТИЛЬНОСТЬ</b> (NATR {natr}%)"
+        warning = ("\n━━━━━━━━━━━━━━━━━━━\n"
+                   f"⚠️ Высокий NATR: сквиз может быть 3–5%\n"
+                   f"Ставь лимит у уровня, стакан обязателен")
+    elif mode == "HOT":
+        header = f"🔥 HOT · <b>{symbol}</b> · {stars_str(stars)}"
+        mode_line = f"Режим: <b>повышенная волатильность</b> (NATR {natr}%)"
+        warning = ""
+    else:
+        touch_label = {1: "1й вход", 2: "2е касание ✅", 3: "3е касание 🎯"}.get(touch_num, f"касание {touch_num}")
+        header = f"📍 <b>{symbol}</b> · {touch_label} · {stars_str(stars)}"
+        mode_line = f"Режим: нормальный (NATR {natr}%)"
+        warning = ""
+
+    squeeze_hint = "· сквизует к уровню" if dist_pct < radius_for_mode(mode) / 2 else ""
+
+    lines = [
+        header,
+        "━━━━━━━━━━━━━━━━━━━",
+        mode_line,
+        f"Цена: <b>{close:.6g}</b> {squeeze_hint}",
+        f"Уровень: <b>{level['price']:.6g}</b> [{level['tf']}] · расстояние: <b>{dist_pct}%</b> ({ltype})",
+        f"Объём: <b>{vol_mult_val:.1f}x</b> от нормы",
+        f"CVD: <b>{_cvd_str(cvd)}</b>",
+        f"Стакан: <b>{_ob_str(ob_pressure)}</b>",
+        f"Тренд 15m: <b>{_trend_str(trend)}</b>",
+    ]
+    if pattern_name:
+        lines.append(f"Паттерн: <b>{pattern_name}</b>")
+    lines.append(f"\n💎 <b>{coin}</b>")
+    if warning:
+        lines.append(warning)
+    return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
+#  ДЕДУПЛИКАЦИЯ АЛЕРТОВ
+# ─────────────────────────────────────────────
+
+def can_alert(symbol, touch_num, cooldown=180):
+    now = time.time()
+    key = f"{symbol}_{touch_num}"
+    with alert_lock:
+        last = alert_cache.get(key, 0)
+        if now - last >= cooldown:
+            alert_cache[key] = now
+            return True
+    return False
+
+
+# ─────────────────────────────────────────────
+#  СЛОЙ 1 — БЫСТРОЕ ОБНАРУЖЕНИЕ
+# ─────────────────────────────────────────────
+
+def get_all_symbols():
     data = fetch(f"{BINANCE_BASE}/fapi/v1/exchangeInfo")
     if not data:
         return []
-    return [
-        s["symbol"] for s in data["symbols"]
-        if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"
-    ]
+    return [s["symbol"] for s in data["symbols"]
+            if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
 
+def layer1_scan_symbol(symbol):
+    """Проверяет один символ на объём-спайк. Возвращает (trigger, vol_mult) или None."""
+    k5 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+               {"symbol": symbol, "interval": "5m", "limit": 16})
+    if not k5 or len(k5) < 14:
+        return None
+    recent, mult = volume_mult(k5, lookback=12)
+    if mult >= VOLUME_SPIKE_C: return "C", mult, k5, recent
+    if mult >= VOLUME_SPIKE_B: return "B", mult, k5, recent
+    if mult >= VOLUME_SPIKE_A: return "A", mult, k5, recent
+    return None
 
-def scan_symbol(symbol):
-    sent = 0
-    try:
-        k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                   {"symbol": symbol, "interval": "1m", "limit": 120})
-        if not k1 or len(k1) < 20:
-            return 0
-
-        k5 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                   {"symbol": symbol, "interval": "5m", "limit": 14})
-
-        close      = float(k1[-1][4])
-        prev_close = float(k1[-2][4])
-        atr        = calc_atr(k1, 14)
-        natr       = calc_natr(atr, close)
-        price_chg  = (close - prev_close) / prev_close * 100 if prev_close else 0
-
-        volume_5m, vol_mult = volume_spike(k5)
-
-        levels            = find_all_levels(symbol, k1)
-        near, level, dist = is_near_level(close, levels)
-        pattern_name, pat_dir = detect_pattern(k1)
-        trend             = get_trend_15m(symbol)
-        cvd               = calc_cvd(k1)
-        impulse_min       = minutes_since_impulse(k1)
-
-        if abs(price_chg) >= PRICE_CHANGE_PCT and should_send_s2(symbol):
-            sig_dir = "bull" if price_chg > 0 else "bear"
-            stars   = calc_stars(near, pat_dir, sig_dir, trend, vol_mult, cvd, impulse_min)
-            if stars >= MIN_SIGNAL_STARS:
-                direction = "🚀" if price_chg > 0 else "💥"
-                sign = "+" if price_chg > 0 else ""
-                main_line = f"{direction} Изменение цены: <b><u>{sign}{price_chg:.2f}%</u></b>"
-                cap = build_caption(
-                    "⚡️ <b>Резкое движение цены</b>", symbol, main_line,
-                    natr, volume_5m, vol_mult, level, dist,
-                    pattern_name, trend, cvd, impulse_min, stars
-                )
-                print(f"  ⚡ ЦЕНА: {symbol} | Δ={price_chg:+.2f}% | ⭐{stars}")
-                chart = build_chart(symbol, k1, levels)
-                if chart:
-                    send_photo(chart, cap)
-                else:
-                    send_message(cap)
-                sent += 1
-
-        if natr >= NATR_MIN and volume_5m >= VOLUME_5M_MIN and should_send_s1(symbol, natr):
-            sig_dir = "bull" if float(k1[-1][4]) >= float(k1[-1][1]) else "bear"
-            stars   = calc_stars(near, pat_dir, sig_dir, trend, vol_mult, cvd, impulse_min)
-            if stars >= MIN_SIGNAL_STARS:
-                main_line = f"📈 Natr (1 мин): <b><u>{natr}%</u></b>"
-                cap = build_caption(
-                    "📊 <b>NATR-сигнал</b>", symbol, main_line,
-                    natr, volume_5m, vol_mult, level, dist,
-                    pattern_name, trend, cvd, impulse_min, stars
-                )
-                print(f"  ✅ NATR: {symbol} | {natr}% | VOL={format_volume(volume_5m)} | ⭐{stars}")
-                chart = build_chart(symbol, k1, levels)
-                if chart:
-                    send_photo(chart, cap)
-                else:
-                    send_message(cap)
-                sent += 1
-
-    except Exception as e:
-        print(f"  [ERR {symbol}] {e}")
-    return sent
-
-
-def main_loop():
-    print("🚀 Скринер v3 запущен. Ожидание сигналов...\n")
-
-    # Загружаем прокси при старте
-    refresh_proxies()
-
-    # Обновляем прокси каждые 30 минут в фоне
-    def proxy_refresher():
-        while True:
-            time.sleep(1800)
-            refresh_proxies()
-
-    threading.Thread(target=proxy_refresher, daemon=True).start()
-
+def layer1_loop(symbols_ref):
+    """Бесконечный цикл Слоя 1."""
+    print("  [L1] Слой 1 запущен")
     while True:
         start = time.time()
-        ts = datetime.now().strftime("%H:%M:%S")
-        print(f"[{ts}] Сканирование...")
+        symbols = symbols_ref[0]
+        if not symbols:
+            time.sleep(LAYER1_INTERVAL)
+            continue
 
-        symbols = get_symbols()
-        print(f"  Найдено символов: {len(symbols)}")
+        def scan_one(sym):
+            result = layer1_scan_symbol(sym)
+            if result is None:
+                return
+            trigger, mult, k5, recent_vol = result
+            close = float(k5[-1][4])
 
-        signals = 0
+            with active_lock:
+                already_active = sym in active_coins
+                active_coins[sym] = {
+                    "since":         time.time(),
+                    "impulse_price": close,
+                    "vol_mult":      mult,
+                    "touches":       active_coins.get(sym, {}).get("touches", 0),
+                    "levels":        active_coins.get(sym, {}).get("levels", []),
+                    "last_level_scan": 0,
+                }
+
+            if not already_active:
+                msg = build_layer1_alert(sym, mult, trigger)
+                send_message(msg)
+                print(f"  [L1] 🔥 {sym} | {trigger} | {mult:.1f}x")
+
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = {pool.submit(scan_symbol, s): s for s in symbols}
-            for f in as_completed(futures):
-                try:
-                    signals += f.result()
-                except Exception:
-                    pass
+            list(pool.map(scan_one, symbols))
+
+        # Удаляем протухшие монеты
+        now = time.time()
+        with active_lock:
+            expired = [s for s, v in active_coins.items()
+                       if now - v["since"] > ACTIVE_TTL]
+            for s in expired:
+                del active_coins[s]
+                print(f"  [L1] ⏰ {s} убран из активных")
 
         elapsed = time.time() - start
-        print(f"  Сигналов: {signals} | Время: {elapsed:.1f}s\n")
-        time.sleep(max(0, SCAN_INTERVAL_SEC - elapsed))
+        time.sleep(max(0, LAYER1_INTERVAL - elapsed))
+
+
+# ─────────────────────────────────────────────
+#  СЛОЙ 2 — СЛЕЖЕНИЕ ЗА УРОВНЯМИ
+# ─────────────────────────────────────────────
+
+def layer2_watch_symbol(symbol, state):
+    """Обновляет уровни и проверяет касание для одной монеты."""
+    k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+               {"symbol": symbol, "interval": "1m", "limit": 120})
+    if not k1 or len(k1) < 20:
+        return
+
+    close = float(k1[-1][4])
+    natr  = calc_natr(k1)
+    mode  = natr_mode(natr)
+    radius = radius_for_mode(mode)
+
+    # Обновляем уровни раз в 2 минуты
+    now = time.time()
+    if now - state.get("last_level_scan", 0) > 120:
+        levels = collect_levels(symbol, k1)
+        # Добавляем импульсный уровень из Слоя 1
+        imp = state.get("impulse_price")
+        if imp:
+            levels.append({"price": imp, "touches": 1, "type": "sup", "tf": "impulse"})
+        state["levels"] = levels
+        state["last_level_scan"] = now
+    else:
+        levels = state.get("levels", [])
+
+    # Флэт-детектор
+    flat = is_flat(k1)
+
+    # Проверяем близость к уровню
+    near, level, dist_pct = near_any_level(close, levels, radius)
+    if not near:
+        return
+
+    # Передаём в Слой 3
+    layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
+                    state, k1, flat)
+
+def layer2_loop():
+    """Бесконечный цикл Слоя 2."""
+    print("  [L2] Слой 2 запущен")
+    while True:
+        with active_lock:
+            snapshot = dict(active_coins)
+
+        if not snapshot:
+            time.sleep(5)
+            continue
+
+        for symbol, state in snapshot.items():
+            # Адаптивный интервал: смотрим прошлый NATR если есть
+            k1_quick = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                             {"symbol": symbol, "interval": "1m", "limit": 5})
+            if k1_quick:
+                natr_q = calc_natr(k1_quick) if len(k1_quick) >= 15 else 1.0
+                mode_q = natr_mode(natr_q)
+                interval = layer2_interval(mode_q)
+            else:
+                interval = LAYER2_INTERVAL_NORMAL
+
+            last_scan = state.get("last_l2_scan", 0)
+            if time.time() - last_scan < interval:
+                continue
+
+            with active_lock:
+                if symbol in active_coins:
+                    active_coins[symbol]["last_l2_scan"] = time.time()
+
+            try:
+                layer2_watch_symbol(symbol, state)
+            except Exception as e:
+                print(f"  [L2 ERR {symbol}] {e}")
+
+        time.sleep(1)
+
+
+# ─────────────────────────────────────────────
+#  СЛОЙ 3 — ОЦЕНКА И АЛЕРТ
+# ─────────────────────────────────────────────
+
+def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
+                    state, k1, flat):
+    """Мгновенная оценка сигнала и отправка алерта."""
+
+    # Считаем касания
+    touch_num = state.get("touches", 0) + 1
+
+    # Дедупликация
+    if not can_alert(symbol, touch_num):
+        return
+
+    # Определяем направление
+    sig_dir = "bull" if level["type"] == "sup" else "bear"
+
+    # Паттерн
+    pattern_name, pat_dir = detect_pattern(k1)
+
+    # Тренд 15m
+    k15 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                {"symbol": symbol, "interval": "15m", "limit": 55})
+    trend = get_trend(k15) if k15 else "flat"
+
+    # CVD
+    cvd = calc_cvd(k1)
+
+    # Стакан (последним, как указано)
+    k5 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+               {"symbol": symbol, "interval": "5m", "limit": 16})
+    _, vol_mult_val = volume_mult(k5) if k5 else (0, state.get("vol_mult", 1))
+    vol_mult_val = vol_mult_val or state.get("vol_mult", 1)
+
+    ob_pressure = get_order_book_pressure(symbol, vol_mult_val)
+
+    # Рейтинг
+    stars = calc_stars(True, pat_dir, sig_dir, trend, vol_mult_val,
+                       cvd, touch_num, ob_pressure, mode)
+
+    if stars < MIN_STARS:
+        return
+
+    # Обновляем касания
+    with active_lock:
+        if symbol in active_coins:
+            active_coins[symbol]["touches"] = touch_num
+            # Пробой уровня — сброс касаний
+            if touch_num >= MAX_TOUCHES:
+                active_coins[symbol]["touches"] = 0
+
+    # Строим алерт
+    caption = build_layer3_alert(
+        symbol, close, level, dist_pct, natr, vol_mult_val,
+        cvd, pattern_name, trend, ob_pressure,
+        touch_num, stars, mode, len(k1)
+    )
+
+    print(f"  [L3] 🎯 {symbol} | {mode} | касание {touch_num} | ⭐{stars} | dist={dist_pct}%")
+
+    chart = build_chart(symbol, k1, state.get("levels", []))
+    if chart:
+        send_photo(chart, caption)
+    else:
+        send_message(caption)
+
+
+# ─────────────────────────────────────────────
+#  ГЛАВНЫЙ ЗАПУСК
+# ─────────────────────────────────────────────
+
+def main():
+    print("🚀 Crypto Screener v4 — 3-слойная архитектура\n")
+
+    # Прокси
+    refresh_proxies()
+    threading.Thread(target=lambda: [time.sleep(1800) or refresh_proxies()
+                                     for _ in iter(int, 1)], daemon=True).start()
+
+    # Список символов (обновляется каждые 5 мин)
+    symbols_ref = [[]]
+    def refresh_symbols():
+        while True:
+            s = get_all_symbols()
+            if s:
+                symbols_ref[0] = s
+                print(f"  [SYM] Символов: {len(s)}")
+            time.sleep(300)
+    threading.Thread(target=refresh_symbols, daemon=True).start()
+    # Первая загрузка
+    time.sleep(3)
+    symbols_ref[0] = get_all_symbols()
+    print(f"  [SYM] Символов загружено: {len(symbols_ref[0])}")
+
+    # Слой 2 в отдельном потоке
+    threading.Thread(target=layer2_loop, daemon=True).start()
+
+    # Слой 1 — основной поток
+    layer1_loop(symbols_ref)
 
 
 if __name__ == "__main__":
-    main_loop()
+    main()
