@@ -7,6 +7,7 @@ import requests
 import time
 import threading
 import io
+import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -44,16 +45,85 @@ BINANCE_BASE = "https://fapi.binance.com"
 signal_cache_1: dict = {}
 signal_cache_2: dict = {}
 cache_lock = threading.Lock()
+proxy_lock = threading.Lock()
+
+# ── ПРОКСИ ────────────────────────────────────
+
+PROXY_LIST = []
+current_proxy = {"http": None, "https": None}
+
+
+def fetch_free_proxies():
+    global PROXY_LIST
+    sources = [
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    ]
+    proxies = []
+    for url in sources:
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                lines = r.text.strip().split("\n")
+                for line in lines:
+                    line = line.strip()
+                    if line and ":" in line:
+                        proxies.append(line)
+        except Exception as e:
+            print(f"  [PROXY FETCH ERR] {e}")
+    random.shuffle(proxies)
+    PROXY_LIST = proxies[:100]
+    print(f"  [PROXY] Загружено прокси: {len(PROXY_LIST)}")
+
+
+def test_proxy(proxy_str):
+    proxy = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
+    try:
+        r = requests.get(f"{BINANCE_BASE}/fapi/v1/ping", proxies=proxy, timeout=8)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def find_working_proxy():
+    global current_proxy
+    print("  [PROXY] Ищу рабочий прокси для Binance...")
+    for proxy_str in PROXY_LIST:
+        if test_proxy(proxy_str):
+            with proxy_lock:
+                current_proxy = {
+                    "http": f"http://{proxy_str}",
+                    "https": f"http://{proxy_str}"
+                }
+            print(f"  [PROXY] ✅ Рабочий прокси: {proxy_str}")
+            return True
+    print("  [PROXY] ❌ Рабочий прокси не найден, работаю без прокси")
+    with proxy_lock:
+        current_proxy = {"http": None, "https": None}
+    return False
+
+
+def refresh_proxies():
+    fetch_free_proxies()
+    find_working_proxy()
+
+
+# ── HTTP ──────────────────────────────────────
 
 http = requests.Session()
 http.headers.update({"User-Agent": "CryptoScreener/3.0"})
 
 
 def fetch(url, params=None):
+    with proxy_lock:
+        proxy = dict(current_proxy)
     try:
-        r = http.get(url, params=params, timeout=10)
+        r = http.get(url, params=params, timeout=10, proxies=proxy)
         if r.status_code == 200:
             return r.json()
+        elif r.status_code == 451:
+            print("  [PROXY] Binance заблокировал IP, меняю прокси...")
+            threading.Thread(target=find_working_proxy, daemon=True).start()
     except Exception as e:
         print(f"  [HTTP ERR] {e}")
     return None
@@ -84,7 +154,6 @@ def format_volume(v):
 
 
 def format_dollar(v):
-    """Форматирует объём в долларах для оси графика."""
     if v >= 1_000_000:
         return f"${v/1_000_000:.1f}M"
     if v >= 1_000:
@@ -95,10 +164,8 @@ def format_dollar(v):
 # ── УРОВНИ ────────────────────────────────────
 
 def find_levels_for_tf(candles, tf_label, min_touches=2):
-    """Находит уровни по конкретному набору свечей."""
     highs  = [float(c[2]) for c in candles]
     lows   = [float(c[3]) for c in candles]
-
     pivot_highs = []
     pivot_lows  = []
     wing = 2
@@ -132,24 +199,16 @@ def find_levels_for_tf(candles, tf_label, min_touches=2):
 
 
 def find_all_levels(symbol, k1):
-    """Собирает уровни с 1m, 5m и 15m таймфреймов."""
     all_levels = []
-
-    # 1m уровни из уже загруженных свечей
     all_levels += find_levels_for_tf(k1[-100:], "1m")
-
-    # 5m уровни
     k5 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                {"symbol": symbol, "interval": "5m", "limit": 100})
     if k5:
         all_levels += find_levels_for_tf(k5, "5m")
-
-    # 15m уровни
     k15 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                 {"symbol": symbol, "interval": "15m", "limit": 100})
     if k15:
         all_levels += find_levels_for_tf(k15, "15m")
-
     return all_levels
 
 
@@ -308,18 +367,9 @@ def should_send_s2(symbol):
 
 # ── ГРАФИК ────────────────────────────────────
 
-# Цвета уровней по таймфрейму
 TF_COLORS = {
-    "sup": {
-        "1m":  "#00e5ff",   # яркий циан
-        "5m":  "#00ff99",   # яркий зелёный
-        "15m": "#ffff00",   # жёлтый
-    },
-    "res": {
-        "1m":  "#ff4444",   # красный
-        "5m":  "#ff8800",   # оранжевый
-        "15m": "#ff44ff",   # пурпурный
-    }
+    "sup": {"1m": "#00e5ff", "5m": "#00ff99", "15m": "#ffff00"},
+    "res": {"1m": "#ff4444", "5m": "#ff8800", "15m": "#ff44ff"}
 }
 
 
@@ -327,7 +377,6 @@ def build_chart(symbol, candles, levels=None):
     try:
         data = candles[-60:]
         n = len(data)
-
         opens   = [float(c[1]) for c in data]
         highs   = [float(c[2]) for c in data]
         lows    = [float(c[3]) for c in data]
@@ -352,15 +401,12 @@ def build_chart(symbol, candles, levels=None):
             ax1.add_patch(Rectangle((i - w/2, body_y), w, body_h,
                                      facecolor=color, edgecolor=color))
 
-        # ── Уровни с цветом по типу и ТФ ──
         if levels:
             price_min = min(lows)
             price_max = max(highs)
             margin = (price_max - price_min) * 0.15
-            visible = [
-                lv for lv in levels
-                if price_min - margin <= lv["price"] <= price_max + margin
-            ]
+            visible = [lv for lv in levels
+                       if price_min - margin <= lv["price"] <= price_max + margin]
             seen = []
             deduped = []
             for lv in sorted(visible, key=lambda x: x["price"]):
@@ -368,7 +414,6 @@ def build_chart(symbol, candles, levels=None):
                 if not too_close:
                     deduped.append(lv)
                     seen.append(lv["price"])
-
             for lv in deduped[:10]:
                 tf  = lv["tf"]
                 typ = lv["type"]
@@ -378,34 +423,25 @@ def build_chart(symbol, candles, levels=None):
                 ax1.axhline(y=lv["price"], color=color, linewidth=lw,
                             linestyle=ls, alpha=0.9, zorder=5)
                 label = f" {lv['price']:.6g}  [{tf}] ×{lv['touches']}"
-                ax1.text(n - 0.5, lv["price"], label,
-                         color=color, fontsize=7, va="center",
-                         fontweight="bold",
+                ax1.text(n - 0.5, lv["price"], label, color=color, fontsize=7,
+                         va="center", fontweight="bold",
                          bbox=dict(facecolor="#0d1117", alpha=0.6, pad=1, edgecolor="none"))
 
-            # Легенда уровней
             from matplotlib.lines import Line2D
             legend_items = []
             for tf, tc in [("1m", "#00e5ff"), ("5m", "#00ff99"), ("15m", "#ffff00")]:
-                legend_items.append(Line2D([0], [0], color=tc, lw=1.2,
-                                           label=f"Sup {tf}"))
+                legend_items.append(Line2D([0], [0], color=tc, lw=1.2, label=f"Sup {tf}"))
             for tf, tc in [("1m", "#ff4444"), ("5m", "#ff8800"), ("15m", "#ff44ff")]:
-                legend_items.append(Line2D([0], [0], color=tc, lw=1.2,
-                                           label=f"Res {tf}"))
-            ax1.legend(handles=legend_items, loc="upper left",
-                       fontsize=6, ncol=2,
+                legend_items.append(Line2D([0], [0], color=tc, lw=1.2, label=f"Res {tf}"))
+            ax1.legend(handles=legend_items, loc="upper left", fontsize=6, ncol=2,
                        facecolor="#161b22", edgecolor="#30363d",
                        labelcolor="white", framealpha=0.8)
 
-        # ── Объём в долларах ──
         for i in range(n):
             color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
             ax2.bar(i, dollar_vols[i], color=color, width=w, alpha=0.85)
 
-        ax2.yaxis.set_major_formatter(
-            mticker.FuncFormatter(lambda x, _: format_dollar(x))
-        )
-
+        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: format_dollar(x)))
         tick_idx = list(range(0, n, max(1, n // 6)))
         for ax in [ax1, ax2]:
             ax.set_xticks(tick_idx)
@@ -547,7 +583,6 @@ def scan_symbol(symbol):
         cvd               = calc_cvd(k1)
         impulse_min       = minutes_since_impulse(k1)
 
-        # ── Сценарий 2: резкое изменение цены ──
         if abs(price_chg) >= PRICE_CHANGE_PCT and should_send_s2(symbol):
             sig_dir = "bull" if price_chg > 0 else "bear"
             stars   = calc_stars(near, pat_dir, sig_dir, trend, vol_mult, cvd, impulse_min)
@@ -568,7 +603,6 @@ def scan_symbol(symbol):
                     send_message(cap)
                 sent += 1
 
-        # ── Сценарий 1: NATR + Volume ──
         if natr >= NATR_MIN and volume_5m >= VOLUME_5M_MIN and should_send_s1(symbol, natr):
             sig_dir = "bull" if float(k1[-1][4]) >= float(k1[-1][1]) else "bear"
             stars   = calc_stars(near, pat_dir, sig_dir, trend, vol_mult, cvd, impulse_min)
@@ -594,6 +628,18 @@ def scan_symbol(symbol):
 
 def main_loop():
     print("🚀 Скринер v3 запущен. Ожидание сигналов...\n")
+
+    # Загружаем прокси при старте
+    refresh_proxies()
+
+    # Обновляем прокси каждые 30 минут в фоне
+    def proxy_refresher():
+        while True:
+            time.sleep(1800)
+            refresh_proxies()
+
+    threading.Thread(target=proxy_refresher, daemon=True).start()
+
     while True:
         start = time.time()
         ts = datetime.now().strftime("%H:%M:%S")
