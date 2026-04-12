@@ -49,6 +49,9 @@ RADIUS_NORMAL       = 0.5      # %
 RADIUS_HOT          = 0.8      # %
 RADIUS_WILD         = 1.5      # %
 
+# Фильтр ликвидности
+MIN_VOL_5M_USD      = 100_000  # минимум $100k объёма за последние 5 мин
+
 # Слой 3
 MIN_STARS           = 2
 ORDER_BOOK_DEPTH    = 20
@@ -541,9 +544,14 @@ def build_layer3_alert(symbol, close, level, dist_pct, natr, vol_mult_val,
 #  ДЕДУПЛИКАЦИЯ АЛЕРТОВ
 # ─────────────────────────────────────────────
 
-def can_alert(symbol, touch_num, cooldown=180):
+def can_alert(symbol, touch_num, level_price=0, cooldown=60):
+    """
+    Дедупликация: один и тот же символ + уровень не шлётся чаще cooldown сек.
+    При новом касании (touch_num меняется) — пропускаем сразу.
+    """
     now = time.time()
-    key = f"{symbol}_{touch_num}"
+    # Ключ: символ + округлённая цена уровня + номер касания
+    key = f"{symbol}_{round(level_price, 6)}_{touch_num}"
     with alert_lock:
         last = alert_cache.get(key, 0)
         if now - last >= cooldown:
@@ -564,12 +572,15 @@ def get_all_symbols():
             if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
 
 def layer1_scan_symbol(symbol):
-    """Проверяет один символ на объём-спайк. Возвращает (trigger, vol_mult) или None."""
+    """Проверяет один символ на объём-спайк. Возвращает (trigger, vol_mult, k5, recent) или None."""
     k5 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                {"symbol": symbol, "interval": "5m", "limit": 16})
     if not k5 or len(k5) < 14:
         return None
     recent, mult = volume_mult(k5, lookback=12)
+    # Фильтр ликвидности: минимум $100k за последние 5 мин
+    if recent < MIN_VOL_5M_USD:
+        return None
     if mult >= VOLUME_SPIKE_C: return "C", mult, k5, recent
     if mult >= VOLUME_SPIKE_B: return "B", mult, k5, recent
     if mult >= VOLUME_SPIKE_A: return "A", mult, k5, recent
@@ -714,8 +725,8 @@ def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
     # Считаем касания
     touch_num = state.get("touches", 0) + 1
 
-    # Дедупликация
-    if not can_alert(symbol, touch_num):
+    # Дедупликация: один символ + один уровень не дублируется чаще 60 сек
+    if not can_alert(symbol, touch_num, level_price=level["price"]):
         return
 
     # Определяем направление
