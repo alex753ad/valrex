@@ -36,7 +36,7 @@ ACTIVE_TTL          = 600      # сек — сколько монета оста
 # Слой 2
 LAYER2_INTERVAL_NORMAL = 30    # сек, режим NORMAL
 LAYER2_INTERVAL_HOT    = 20    # сек, режим HOT
-LAYER2_INTERVAL_WILD   = 15    # сек, режим WILD
+LAYER2_INTERVAL_WILD   = 5     # сек, режим WILD
 MAX_TOUCHES         = 3        # касаний до сброса
 FLAT_CANDLES        = 10       # свечей для определения флэта
 
@@ -51,6 +51,7 @@ RADIUS_WILD         = 1.5      # %
 
 # Фильтр ликвидности
 MIN_VOL_5M_USD      = 100_000  # минимум $100k объёма за последние 5 мин
+MIN_NATR            = 0.9      # минимальный NATR для наблюдения (%)
 
 # Слой 3
 MIN_STARS           = 2
@@ -572,19 +573,40 @@ def get_all_symbols():
             if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
 
 def layer1_scan_symbol(symbol):
-    """Проверяет один символ на объём-спайк. Возвращает (trigger, vol_mult, k5, recent) или None."""
+    """Проверяет один символ на объём-спайк. Возвращает кортеж с данными пробойной свечи или None."""
     k5 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                {"symbol": symbol, "interval": "5m", "limit": 16})
     if not k5 or len(k5) < 14:
         return None
     recent, mult = volume_mult(k5, lookback=12)
+
     # Фильтр ликвидности: минимум $100k за последние 5 мин
     if recent < MIN_VOL_5M_USD:
         return None
-    if mult >= VOLUME_SPIKE_C: return "C", mult, k5, recent
-    if mult >= VOLUME_SPIKE_B: return "B", mult, k5, recent
-    if mult >= VOLUME_SPIKE_A: return "A", mult, k5, recent
-    return None
+
+    if mult < VOLUME_SPIKE_A:
+        return None
+
+    # Проверяем NATR по последним 1m свечам
+    k1_check = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                     {"symbol": symbol, "interval": "1m", "limit": 20})
+    if k1_check and len(k1_check) >= 15:
+        natr_check = calc_natr(k1_check)
+        if natr_check < MIN_NATR:
+            return None  # монета слишком вялая
+
+    # Пробойная свеча = k5[-2] (закрытая, та что дала спайк)
+    spike_candle  = k5[-2]
+    imp_close     = float(spike_candle[4])   # close пробойной
+    imp_high      = float(spike_candle[2])   # high  пробойной
+    imp_low       = float(spike_candle[3])   # low   пробойной
+    current_close = float(k5[-1][4])         # текущая цена
+
+    trigger = "C" if mult >= VOLUME_SPIKE_C else \
+              "B" if mult >= VOLUME_SPIKE_B else "A"
+
+    return (trigger, mult, k5, recent,
+            imp_close, imp_high, imp_low, current_close)
 
 def layer1_loop(symbols_ref):
     """Бесконечный цикл Слоя 1."""
@@ -600,24 +622,29 @@ def layer1_loop(symbols_ref):
             result = layer1_scan_symbol(sym)
             if result is None:
                 return
-            trigger, mult, k5, recent_vol = result
-            close = float(k5[-1][4])
+            trigger, mult, k5, recent_vol, \
+                imp_close, imp_high, imp_low, cur_close = result
 
             with active_lock:
                 already_active = sym in active_coins
                 active_coins[sym] = {
-                    "since":         time.time(),
-                    "impulse_price": close,
-                    "vol_mult":      mult,
-                    "touches":       active_coins.get(sym, {}).get("touches", 0),
-                    "levels":        active_coins.get(sym, {}).get("levels", []),
+                    "since":          time.time(),
+                    "impulse_close":  imp_close,
+                    "impulse_high":   imp_high,
+                    "impulse_low":    imp_low,
+                    "impulse_price":  cur_close,
+                    "vol_mult":       mult,
+                    "touches":        active_coins.get(sym, {}).get("touches", 0),
+                    "levels":         active_coins.get(sym, {}).get("levels", []),
                     "last_level_scan": 0,
+                    "last_natr":      2.0,
+                    "pullback_high":  0,
                 }
 
             if not already_active:
                 msg = build_layer1_alert(sym, mult, trigger)
                 send_message(msg)
-                print(f"  [L1] 🔥 {sym} | {trigger} | {mult:.1f}x")
+                print(f"  [L1] 🔥 {sym} | {trigger} | {mult:.1f}x | imp_close={imp_close:.6g}")
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             list(pool.map(scan_one, symbols))
@@ -639,6 +666,97 @@ def layer1_loop(symbols_ref):
 #  СЛОЙ 2 — СЛЕЖЕНИЕ ЗА УРОВНЯМИ
 # ─────────────────────────────────────────────
 
+def get_price_fast(symbol):
+    """Только текущая цена — один лёгкий запрос."""
+    data = fetch(f"{BINANCE_BASE}/fapi/v1/ticker/price", {"symbol": symbol})
+    return float(data["price"]) if data else None
+
+
+def layer2_watch_symbol_fast(symbol, state):
+    """
+    Быстрая проверка для WILD монет.
+    Грузит только цену, свечи — только при обнаружении касания.
+    """
+    close = get_price_fast(symbol)
+    if not close:
+        return
+    levels = state.get("levels", [])
+    if not levels:
+        return
+    natr   = state.get("last_natr", 2.0)
+    mode   = natr_mode(natr)
+    radius = radius_for_mode(mode)
+    near, level, dist_pct = near_any_level(close, levels, radius)
+    if not near:
+        return
+    # Касание найдено — грузим свечи для оценки
+    k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+               {"symbol": symbol, "interval": "1m", "limit": 60})
+    if not k1:
+        return
+    flat = is_flat(k1)
+    layer3_evaluate(symbol, close, level, dist_pct, natr, mode, state, k1, flat)
+
+
+def detect_pullback(symbol, state, k1):
+    """
+    Детектор начала отката от хая к уровню.
+    Шлёт алерт ДО касания — чтобы успеть поставить лимит.
+    """
+    if len(k1) < 10:
+        return
+    closes = [float(c[4]) for c in k1]
+    highs  = [float(c[2]) for c in k1]
+    close  = closes[-1]
+    natr   = calc_natr(k1)
+
+    recent_high = max(highs[-10:])
+    drop_pct    = (recent_high - close) / recent_high * 100
+
+    # Откат от хая >= 0.5 * NATR
+    if drop_pct < natr * 0.5:
+        return
+
+    # Последние 2 свечи идут вниз
+    if not (closes[-1] < closes[-2] and closes[-2] < closes[-3]):
+        return
+
+    # Есть уровень поддержки ниже текущей цены
+    levels = state.get("levels", [])
+    sup_levels = [lv for lv in levels if lv["type"] == "sup" and lv["price"] < close]
+    if not sup_levels:
+        return
+
+    nearest    = max(sup_levels, key=lambda x: x["price"])
+    dist_to_lv = (close - nearest["price"]) / close * 100
+
+    # Уровень в диапазоне 0.3% – 3*NATR
+    if not (0.3 <= dist_to_lv <= natr * 3):
+        return
+
+    # Дедупликация по хаю
+    last_high = state.get("pullback_high", 0)
+    if last_high > 0 and abs(recent_high - last_high) / recent_high * 100 < 0.3:
+        return
+
+    with active_lock:
+        if symbol in active_coins:
+            active_coins[symbol]["pullback_high"] = recent_high
+
+    msg = (
+        f"📉 <b>{symbol}</b> — начало отката от хая\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Хай: <b>{recent_high:.6g}</b> → цена: <b>{close:.6g}</b> (−{drop_pct:.1f}%)\n"
+        f"Идёт к уровню: <b>{nearest['price']:.6g}</b> [{nearest['tf']}]\n"
+        f"Расстояние до уровня: <b>{dist_to_lv:.2f}%</b>\n"
+        f"NATR: {natr:.2f}% · режим: {natr_mode(natr)}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ Готовь лимит у уровня · следующий алерт при касании"
+    )
+    send_message(msg)
+    print(f"  [PB] 📉 {symbol} откат {drop_pct:.1f}% → уровень {nearest['price']:.6g} ({dist_to_lv:.2f}%)")
+
+
 def layer2_watch_symbol(symbol, state):
     """Обновляет уровни и проверяет касание для одной монеты."""
     k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
@@ -651,14 +769,24 @@ def layer2_watch_symbol(symbol, state):
     mode  = natr_mode(natr)
     radius = radius_for_mode(mode)
 
+    # Кэшируем NATR для быстрого поллинга
+    with active_lock:
+        if symbol in active_coins:
+            active_coins[symbol]["last_natr"] = natr
+
     # Обновляем уровни раз в 2 минуты
     now = time.time()
     if now - state.get("last_level_scan", 0) > 120:
         levels = collect_levels(symbol, k1)
-        # Добавляем импульсный уровень из Слоя 1
-        imp = state.get("impulse_price")
-        if imp:
-            levels.append({"price": imp, "touches": 1, "type": "sup", "tf": "impulse"})
+        # Три уровня от пробойной свечи Слоя 1
+        impulse_levels = [
+            (state.get("impulse_close"), "sup", "impulse"),
+            (state.get("impulse_high"),  "res", "imp-high"),
+            (state.get("impulse_low"),   "sup", "imp-low"),
+        ]
+        for price, ltype, label in impulse_levels:
+            if price:
+                levels.append({"price": price, "touches": 1, "type": ltype, "tf": label})
         state["levels"] = levels
         state["last_level_scan"] = now
     else:
@@ -666,6 +794,9 @@ def layer2_watch_symbol(symbol, state):
 
     # Флэт-детектор
     flat = is_flat(k1)
+
+    # Детектор отката — шлём алерт ДО касания уровня
+    detect_pullback(symbol, state, k1)
 
     # Проверяем близость к уровню
     near, level, dist_pct = near_any_level(close, levels, radius)
@@ -688,15 +819,17 @@ def layer2_loop():
             continue
 
         for symbol, state in snapshot.items():
-            # Адаптивный интервал: смотрим прошлый NATR если есть
-            k1_quick = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                             {"symbol": symbol, "interval": "1m", "limit": 5})
-            if k1_quick:
-                natr_q = calc_natr(k1_quick) if len(k1_quick) >= 15 else 1.0
-                mode_q = natr_mode(natr_q)
-                interval = layer2_interval(mode_q)
+            # Режим из кэшированного NATR (без лишних запросов)
+            natr_q = state.get("last_natr", 1.0)
+            mode_q = natr_mode(natr_q)
+
+            # WILD: быстрый поллинг только цены
+            if mode_q == "WILD":
+                interval = LAYER2_INTERVAL_WILD
+                watch_fn = layer2_watch_symbol_fast
             else:
-                interval = LAYER2_INTERVAL_NORMAL
+                interval = layer2_interval(mode_q)
+                watch_fn = layer2_watch_symbol
 
             last_scan = state.get("last_l2_scan", 0)
             if time.time() - last_scan < interval:
@@ -707,7 +840,7 @@ def layer2_loop():
                     active_coins[symbol]["last_l2_scan"] = time.time()
 
             try:
-                layer2_watch_symbol(symbol, state)
+                watch_fn(symbol, state)
             except Exception as e:
                 print(f"  [L2 ERR {symbol}] {e}")
 
