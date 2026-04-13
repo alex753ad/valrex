@@ -499,7 +499,7 @@ def build_layer1_alert(symbol, vol_mult_val, trigger):
             f"<i>Слой 1 — жду касания уровня...</i>")
 
 def build_layer3_alert(symbol, close, level, dist_pct, natr, vol_mult_val,
-                       cvd, pattern_name, trend, ob_pressure,
+                       last_1m_vol_usd, cvd, pattern_name, trend, ob_pressure,
                        touch_num, stars, mode, candles_count):
     coin = symbol.replace("USDT", "")
     ltype = "поддержка" if level["type"] == "sup" else "сопротивление"
@@ -528,7 +528,7 @@ def build_layer3_alert(symbol, close, level, dist_pct, natr, vol_mult_val,
         mode_line,
         f"Цена: <b>{close:.6g}</b> {squeeze_hint}",
         f"Уровень: <b>{level['price']:.6g}</b> [{level['tf']}] · расстояние: <b>{dist_pct}%</b> ({ltype})",
-        f"Объём: <b>{vol_mult_val:.1f}x</b> от нормы",
+        f"Объём 1m: <b>{fmt_usd(last_1m_vol_usd)}</b> · спайк: <b>{vol_mult_val:.1f}x</b> от нормы",
         f"CVD: <b>{_cvd_str(cvd)}</b>",
         f"Стакан: <b>{_ob_str(ob_pressure)}</b>",
         f"Тренд 15m: <b>{_trend_str(trend)}</b>",
@@ -878,6 +878,10 @@ def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
                     state, k1, flat):
     """Мгновенная оценка сигнала и отправка алерта."""
 
+    # Жёсткие фильтры прямо в Слое 3
+    if natr < MIN_NATR:
+        return
+
     # Считаем касания
     touch_num = state.get("touches", 0) + 1
 
@@ -896,14 +900,29 @@ def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
                 {"symbol": symbol, "interval": "15m", "limit": 55})
     trend = get_trend(k15) if k15 else "flat"
 
+    # Фильтр: тренд флэт — не торгуем
+    if trend == "flat":
+        return
+
     # CVD
     cvd = calc_cvd(k1)
 
-    # Стакан (последним, как указано)
+    # Объём за последнюю 1m свечу (в USD)
+    last_1m_vol_usd = float(k1[-1][7]) if k1 else 0
+
+    # Фильтр: объём за последнюю минуту < $100k — пропускаем
+    if last_1m_vol_usd < MIN_VOL_5M_USD:
+        return
+
+    # Стакан (последним)
     k5 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                {"symbol": symbol, "interval": "5m", "limit": 16})
-    _, vol_mult_val = volume_mult(k5) if k5 else (0, state.get("vol_mult", 1))
+    live_vol_usd, vol_mult_val = volume_mult(k5) if k5 else (0, state.get("vol_mult", 1))
     vol_mult_val = vol_mult_val or state.get("vol_mult", 1)
+
+    # Фильтр объёма за 5m
+    if live_vol_usd < MIN_VOL_5M_USD:
+        return
 
     ob_pressure = get_order_book_pressure(symbol, vol_mult_val)
 
@@ -918,14 +937,13 @@ def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
     with active_lock:
         if symbol in active_coins:
             active_coins[symbol]["touches"] = touch_num
-            # Пробой уровня — сброс касаний
             if touch_num >= MAX_TOUCHES:
                 active_coins[symbol]["touches"] = 0
 
     # Строим алерт
     caption = build_layer3_alert(
         symbol, close, level, dist_pct, natr, vol_mult_val,
-        cvd, pattern_name, trend, ob_pressure,
+        last_1m_vol_usd, cvd, pattern_name, trend, ob_pressure,
         touch_num, stars, mode, len(k1)
     )
 
