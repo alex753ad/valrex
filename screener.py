@@ -31,7 +31,8 @@ LAYER1_INTERVAL     = 10       # сек между сканами
 VOLUME_SPIKE_A      = 3.0      # триггер А: умеренный спайк
 VOLUME_SPIKE_B      = 5.0      # триггер Б: сильный спайк
 VOLUME_SPIKE_C      = 8.0      # триггер В: экстремальный спайк
-ACTIVE_TTL          = 600      # сек — сколько монета остаётся активной
+ACTIVE_TTL          = 1800     # сек — 30 мин монета остаётся активной
+MIN_VOL_SPIKE_ABS   = 200_000  # минимум $200k абсолютного объёма пробойной свечи
 
 # Слой 2
 LAYER2_INTERVAL_NORMAL = 30    # сек, режим NORMAL
@@ -535,7 +536,7 @@ def build_layer3_alert(symbol, close, level, dist_pct, natr, vol_mult_val,
     ]
     if pattern_name:
         lines.append(f"Паттерн: <b>{pattern_name}</b>")
-    lines.append(f"\n💎 <b>{coin}</b>")
+    lines.append(f"\n💎 <code>{coin}</code>")
     if warning:
         lines.append(warning)
     return "\n".join(lines)
@@ -600,7 +601,12 @@ def layer1_scan_symbol(symbol):
     imp_close     = float(spike_candle[4])   # close пробойной
     imp_high      = float(spike_candle[2])   # high  пробойной
     imp_low       = float(spike_candle[3])   # low   пробойной
+    spike_vol_usd = float(spike_candle[7])   # объём пробойной свечи в USD
     current_close = float(k5[-1][4])         # текущая цена
+
+    # Абсолютный объём пробойной свечи >= $200k
+    if spike_vol_usd < MIN_VOL_SPIKE_ABS:
+        return None
 
     trigger = "C" if mult >= VOLUME_SPIKE_C else \
               "B" if mult >= VOLUME_SPIKE_B else "A"
@@ -707,61 +713,75 @@ def layer2_watch_symbol_fast(symbol, state):
 
 def detect_pullback(symbol, state, k1):
     """
-    Детектор начала отката от хая к уровню.
-    Шлёт алерт ДО касания — чтобы успеть поставить лимит.
+    Детектор начала движения к уровню.
+    Различает:
+    - откат от хая (памп → ищет поддержку)
+    - отскок от лоя (дамп → ищет сопротивление)
     """
     if len(k1) < 10:
         return
     closes = [float(c[4]) for c in k1]
     highs  = [float(c[2]) for c in k1]
+    lows   = [float(c[3]) for c in k1]
     close  = closes[-1]
     natr   = calc_natr(k1)
+    levels = state.get("levels", [])
 
+    # ── ОТКАТ ОТ ХАЯ (памп → цена падает к поддержке) ──
     recent_high = max(highs[-10:])
     drop_pct    = (recent_high - close) / recent_high * 100
+    going_down  = closes[-1] < closes[-2] and closes[-2] < closes[-3]
 
-    # Откат от хая >= 0.5 * NATR
-    if drop_pct < natr * 0.5:
-        return
+    if drop_pct >= natr * 0.5 and going_down:
+        sup_levels = [lv for lv in levels if lv["type"] == "sup" and lv["price"] < close]
+        if sup_levels:
+            nearest    = max(sup_levels, key=lambda x: x["price"])
+            dist_to_lv = (close - nearest["price"]) / close * 100
+            if 0.3 <= dist_to_lv <= natr * 3:
+                last_high = state.get("pullback_high", 0)
+                if last_high == 0 or abs(recent_high - last_high) / recent_high * 100 >= 0.3:
+                    with active_lock:
+                        if symbol in active_coins:
+                            active_coins[symbol]["pullback_high"] = recent_high
+                    msg = (
+                        f"📉 <code>{symbol}</code> — откат от хая\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"Хай: <b>{recent_high:.6g}</b> → цена: <b>{close:.6g}</b> (−{drop_pct:.1f}%)\n"
+                        f"Идёт к поддержке: <b>{nearest['price']:.6g}</b> [{nearest['tf']}]\n"
+                        f"Расстояние: <b>{dist_to_lv:.2f}%</b> · NATR: {natr:.2f}%\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"⏳ Готовь лимит у уровня · следующий алерт при касании"
+                    )
+                    send_message(msg)
+                    print(f"  [PB] 📉 {symbol} откат {drop_pct:.1f}% → поддержка {nearest['price']:.6g}")
 
-    # Последние 2 свечи идут вниз
-    if not (closes[-1] < closes[-2] and closes[-2] < closes[-3]):
-        return
+    # ── ОТСКОК ОТ ЛОЯ (дамп → цена растёт к сопротивлению) ──
+    recent_low  = min(lows[-10:])
+    rise_pct    = (close - recent_low) / recent_low * 100
+    going_up    = closes[-1] > closes[-2] and closes[-2] > closes[-3]
 
-    # Есть уровень поддержки ниже текущей цены
-    levels = state.get("levels", [])
-    sup_levels = [lv for lv in levels if lv["type"] == "sup" and lv["price"] < close]
-    if not sup_levels:
-        return
-
-    nearest    = max(sup_levels, key=lambda x: x["price"])
-    dist_to_lv = (close - nearest["price"]) / close * 100
-
-    # Уровень в диапазоне 0.3% – 3*NATR
-    if not (0.3 <= dist_to_lv <= natr * 3):
-        return
-
-    # Дедупликация по хаю
-    last_high = state.get("pullback_high", 0)
-    if last_high > 0 and abs(recent_high - last_high) / recent_high * 100 < 0.3:
-        return
-
-    with active_lock:
-        if symbol in active_coins:
-            active_coins[symbol]["pullback_high"] = recent_high
-
-    msg = (
-        f"📉 <b>{symbol}</b> — начало отката от хая\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"Хай: <b>{recent_high:.6g}</b> → цена: <b>{close:.6g}</b> (−{drop_pct:.1f}%)\n"
-        f"Идёт к уровню: <b>{nearest['price']:.6g}</b> [{nearest['tf']}]\n"
-        f"Расстояние до уровня: <b>{dist_to_lv:.2f}%</b>\n"
-        f"NATR: {natr:.2f}% · режим: {natr_mode(natr)}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"⏳ Готовь лимит у уровня · следующий алерт при касании"
-    )
-    send_message(msg)
-    print(f"  [PB] 📉 {symbol} откат {drop_pct:.1f}% → уровень {nearest['price']:.6g} ({dist_to_lv:.2f}%)")
+    if rise_pct >= natr * 0.5 and going_up:
+        res_levels = [lv for lv in levels if lv["type"] == "res" and lv["price"] > close]
+        if res_levels:
+            nearest    = min(res_levels, key=lambda x: x["price"])
+            dist_to_lv = (nearest["price"] - close) / close * 100
+            if 0.3 <= dist_to_lv <= natr * 3:
+                last_low = state.get("pullback_low", 0)
+                if last_low == 0 or abs(recent_low - last_low) / recent_low * 100 >= 0.3:
+                    with active_lock:
+                        if symbol in active_coins:
+                            active_coins[symbol]["pullback_low"] = recent_low
+                    msg = (
+                        f"📈 <code>{symbol}</code> — отскок от лоя\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"Лой: <b>{recent_low:.6g}</b> → цена: <b>{close:.6g}</b> (+{rise_pct:.1f}%)\n"
+                        f"Идёт к сопротивлению: <b>{nearest['price']:.6g}</b> [{nearest['tf']}]\n"
+                        f"Расстояние: <b>{dist_to_lv:.2f}%</b> · NATR: {natr:.2f}%\n"
+                        f"━━━━━━━━━━━━━━━━━━━\n"
+                        f"⏳ Готовь лимит у уровня · следующий алерт при касании"
+                    )
+                    send_message(msg)
+                    print(f"  [PB] 📈 {symbol} отскок {rise_pct:.1f}% → сопротивление {nearest['price']:.6g}")
 
 
 def layer2_watch_symbol(symbol, state):
