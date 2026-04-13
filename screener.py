@@ -684,6 +684,13 @@ def layer2_watch_symbol_fast(symbol, state):
     if not levels:
         return
     natr   = state.get("last_natr", 2.0)
+    # Живой фильтр NATR из кэша
+    if natr < MIN_NATR:
+        with active_lock:
+            if symbol in active_coins:
+                del active_coins[symbol]
+        print(f"  [L2] ⚡ {symbol} убран (fast): natr={natr:.2f}%")
+        return
     mode   = natr_mode(natr)
     radius = radius_for_mode(mode)
     near, level, dist_pct = near_any_level(close, levels, radius)
@@ -769,10 +776,26 @@ def layer2_watch_symbol(symbol, state):
     mode  = natr_mode(natr)
     radius = radius_for_mode(mode)
 
+    # ── Живые фильтры: проверяем объём и NATR прямо сейчас ──
+    k5_live = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                    {"symbol": symbol, "interval": "5m", "limit": 16})
+    if k5_live:
+        live_vol, live_mult = volume_mult(k5_live, lookback=12)
+        # Если объём упал ниже $100k или NATR ниже порога — убираем из активных
+        if live_vol < MIN_VOL_5M_USD or natr < MIN_NATR:
+            with active_lock:
+                if symbol in active_coins:
+                    del active_coins[symbol]
+            print(f"  [L2] ⚡ {symbol} убран: vol={live_vol:.0f} natr={natr:.2f}%")
+            return
+    else:
+        live_mult = state.get("vol_mult", 1.0)
+
     # Кэшируем NATR для быстрого поллинга
     with active_lock:
         if symbol in active_coins:
             active_coins[symbol]["last_natr"] = natr
+            active_coins[symbol]["vol_mult"]  = live_mult
 
     # Обновляем уровни раз в 2 минуты
     now = time.time()
