@@ -54,8 +54,15 @@ RADIUS_WILD         = 1.5      # %
 MIN_VOL_5M_USD      = 100_000  # минимум $100k объёма за последние 5 мин
 MIN_NATR            = 0.9      # минимальный NATR для наблюдения (%)
 
-# Слой 3
-MIN_STARS           = 2
+# Инплей модуль
+INPLAY_PUMP_PCT     = 10.0     # % роста от лоя за 30 мин
+INPLAY_PUMP_MINS    = 30       # окно поиска лоя
+INPLAY_NATR_MIN     = 1.0      # минимальный NATR для инплей
+INPLAY_VOL_MULT     = 3.0      # минимальный спайк объёма
+INPLAY_SCAN_SEC     = 20       # интервал сканирования инплей
+INPLAY_TTL          = 3600     # 1 час монета в инплей-наблюдении
+INPLAY_HOLD_CANDLES = 1        # мин закрытых 5m свечей выше уровня
+ZONE_APPROACH_PCT   = 2.0      # % от верхней границы зоны → алерт "идёт к зоне"
 ORDER_BOOK_DEPTH    = 20
 
 MAX_WORKERS         = 20
@@ -75,7 +82,13 @@ active_lock  = threading.Lock()
 alert_cache: dict  = {}
 alert_lock   = threading.Lock()
 
-proxy_lock   = threading.Lock()
+# Инплей: { symbol: { "since", "pump_pct", "levels_stack", "zone", "state",
+#                     "last_alert", "last_zone_alert", "zone_broken_alerted" } }
+inplay_coins: dict = {}
+inplay_lock   = threading.Lock()
+inplay_alert_cache: dict = {}
+
+
 current_proxy = {"http": None, "https": None}
 PROXY_LIST: list = []
 
@@ -977,6 +990,633 @@ def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
 
 
 # ─────────────────────────────────────────────
+#  ИНПЛЕЙ МОДУЛЬ
+# ─────────────────────────────────────────────
+
+def find_broken_levels(k1, k5, k15, current_price):
+    """
+    Находит уровни которые были пробиты снизу вверх и держатся.
+    Уровень считается пробитым если:
+    - Он был сопротивлением (пивот-хай)
+    - Цена закрылась выше него минимум на 1 закрытой 5m свече
+    - Текущая цена выше него
+    Возвращает список уровней отсортированных по цене.
+    """
+    broken = []
+    closes_5m = [float(c[4]) for c in k5]
+    times_5m  = [int(c[0]) for c in k5]
+
+    # Собираем пивот-хаи со всех таймфреймов
+    pivot_candidates = []
+    for candles, tf in [(k1, "1m"), (k5, "5m"), (k15, "15m")]:
+        highs = [float(c[2]) for c in candles]
+        wing  = 2
+        for i in range(wing, len(candles) - wing):
+            if highs[i] >= max(highs[i-wing:i] + highs[i+1:i+wing+1]):
+                pivot_candidates.append({
+                    "price": highs[i],
+                    "tf":    tf,
+                    "time":  int(candles[i][0])
+                })
+
+    # Дедупликация пивотов (убираем слишком близкие)
+    pivot_candidates.sort(key=lambda x: x["price"])
+    deduped = []
+    for pv in pivot_candidates:
+        if not deduped or abs(pv["price"] - deduped[-1]["price"]) / pv["price"] * 100 > 0.2:
+            deduped.append(pv)
+
+    # Проверяем каждый пивот — был ли он пробит и держится ли
+    for pv in deduped:
+        price = pv["price"]
+        if price >= current_price:
+            continue  # выше текущей цены — не интересует
+
+        # Ищем момент пробоя: первая 5m свеча которая закрылась выше уровня
+        breakout_idx = None
+        for i, (c, t) in enumerate(zip(closes_5m, times_5m)):
+            if c > price and t > pv["time"]:
+                breakout_idx = i
+                break
+
+        if breakout_idx is None:
+            continue
+
+        # Проверяем что после пробоя хотя бы INPLAY_HOLD_CANDLES свечей закрылись выше
+        held = sum(1 for c in closes_5m[breakout_idx:] if c > price)
+        if held < INPLAY_HOLD_CANDLES:
+            continue
+
+        # Время удержания в минутах
+        hold_mins = (times_5m[-1] - times_5m[breakout_idx]) // 60000
+
+        broken.append({
+            "price":      price,
+            "tf":         pv["tf"],
+            "hold_mins":  hold_mins,
+            "breakout_i": breakout_idx,
+        })
+
+    broken.sort(key=lambda x: x["price"])
+    return broken
+
+
+def find_round_numbers_in_zone(low, high):
+    """Находит круглые числа внутри зоны."""
+    rounds = []
+    # Определяем шаг круглых чисел по масштабу цены
+    mid = (low + high) / 2
+    if mid < 0.001:    step = 0.0001
+    elif mid < 0.01:   step = 0.001
+    elif mid < 0.1:    step = 0.01
+    elif mid < 1:      step = 0.1
+    elif mid < 10:     step = 0.5
+    elif mid < 100:    step = 1.0
+    else:              step = 5.0
+
+    n = low // step
+    while True:
+        r = round((n + 1) * step, 10)
+        if r > high:
+            break
+        if r > low:
+            rounds.append(round(r, 10))
+        n += 1
+    return rounds
+
+
+def find_inner_levels(k1, k5, zone_low, zone_high):
+    """Находит слабые уровни внутри зоны."""
+    inner = []
+    for candles, tf in [(k1, "1m"), (k5, "5m")]:
+        highs = [float(c[2]) for c in candles]
+        lows  = [float(c[3]) for c in candles]
+        wing  = 2
+        for i in range(wing, len(candles) - wing):
+            h = highs[i]
+            l = lows[i]
+            if zone_low < h < zone_high:
+                if h >= max(highs[i-wing:i] + highs[i+1:i+wing+1]):
+                    inner.append({"price": h, "tf": tf, "type": "res"})
+            if zone_low < l < zone_high:
+                if l <= min(lows[i-wing:i] + lows[i+1:i+wing+1]):
+                    inner.append({"price": l, "tf": tf, "type": "sup"})
+
+    # Дедупликация
+    inner.sort(key=lambda x: x["price"])
+    deduped = []
+    for lv in inner:
+        if not deduped or abs(lv["price"] - deduped[-1]["price"]) / lv["price"] * 100 > 0.3:
+            deduped.append(lv)
+    return deduped
+
+
+def calc_squeeze_probability(k1, k5, zone_high, natr):
+    """
+    Оценивает вероятность сквиза к зоне.
+    Возвращает (вероятность строкой, детали dict).
+    """
+    closes_1m = [float(c[4]) for c in k1[-20:]]
+    vols_1m   = [float(c[7]) for c in k1[-20:]]
+
+    # NATR сжимается?
+    natr_early = calc_natr(k1[-30:-10]) if len(k1) >= 30 else natr
+    natr_now   = calc_natr(k1[-10:])   if len(k1) >= 10 else natr
+    natr_squeeze = natr_early > 0 and (natr_now / natr_early) < 0.75
+
+    # Объём снижается (накопление)?
+    vol_early = sum(vols_1m[:10]) / 10 if len(vols_1m) >= 10 else 0
+    vol_now   = sum(vols_1m[-5:]) / 5  if len(vols_1m) >= 5  else 0
+    vol_declining = vol_now < vol_early * 0.7
+
+    # CVD держится положительным
+    cvd = calc_cvd(k1)
+
+    # Цена консолидирует у хая (последние 5 свечей в диапазоне < NATR)
+    recent_closes = closes_1m[-5:]
+    rng = (max(recent_closes) - min(recent_closes)) / min(recent_closes) * 100 if recent_closes else 0
+    consolidating = rng < natr
+
+    score = 0
+    if natr_squeeze:   score += 2
+    if vol_declining:  score += 1
+    if cvd == "up":    score += 1
+    if consolidating:  score += 2
+
+    if score >= 5:   prob = "🔴 очень высокая"
+    elif score >= 3: prob = "🟡 высокая"
+    elif score >= 2: prob = "🟠 умеренная"
+    else:            prob = "⚪ низкая"
+
+    return prob, {
+        "natr_early":    round(natr_early, 2),
+        "natr_now":      round(natr_now, 2),
+        "natr_squeeze":  natr_squeeze,
+        "vol_declining": vol_declining,
+        "cvd":           cvd,
+        "consolidating": consolidating,
+        "score":         score,
+    }
+
+
+def calc_squeeze_depth(zone_low, zone_high, inner_levels, round_nums, natr):
+    """
+    Рассчитывает ожидаемую глубину сквиза и расставляет лимитки.
+    Возвращает список лимиток с обоснованием.
+    """
+    zone_width = zone_high - zone_low
+    zone_pct   = zone_width / zone_high * 100
+
+    # Все препятствия внутри зоны (уровни + круглые числа), отсортированные сверху вниз
+    obstacles = []
+    for lv in inner_levels:
+        obstacles.append({"price": lv["price"], "reason": f"уровень [{lv['tf']}]", "strength": 1})
+    for r in round_nums:
+        obstacles.append({"price": r, "reason": "круглое число", "strength": 2})
+    obstacles.sort(key=lambda x: x["price"], reverse=True)
+
+    limits = []
+
+    if obstacles:
+        # Есть препятствия — концентрируем в верхней половине + резерв внизу
+        upper_mid = zone_low + zone_width * 0.6  # верхние 40%
+
+        # Первое препятствие сверху
+        first_obstacle = next((o for o in obstacles if o["price"] < zone_high), None)
+
+        if first_obstacle:
+            # L1: чуть выше первого препятствия
+            l1 = round(first_obstacle["price"] * 1.003, 8)
+            if l1 < zone_high:
+                limits.append({
+                    "price":  l1,
+                    "label":  "L1 (агрессивный)",
+                    "reason": f"над {first_obstacle['reason']} {first_obstacle['price']:.6g}"
+                })
+            # L2: у первого препятствия
+            limits.append({
+                "price":  round(first_obstacle["price"] * 0.999, 8),
+                "label":  "L2 (основной)",
+                "reason": f"у {first_obstacle['reason']} {first_obstacle['price']:.6g}"
+            })
+
+        # L3: резерв у нижней границы
+        limits.append({
+            "price":  round(zone_low * 1.005, 8),
+            "label":  "L3 (резерв)",
+            "reason": f"у нижней границы зоны {zone_low:.6g}"
+        })
+    else:
+        # Чистая зона — равномерно на 3 части
+        limits = [
+            {"price": round(zone_low + zone_width * 0.75, 8),
+             "label": "L1 (верх)",   "reason": "верхняя треть зоны"},
+            {"price": round(zone_low + zone_width * 0.50, 8),
+             "label": "L2 (середина)", "reason": "середина зоны"},
+            {"price": round(zone_low + zone_width * 0.20, 8),
+             "label": "L3 (низ)",    "reason": "нижняя треть зоны"},
+        ]
+
+    # Фильтруем лимитки которые вышли за границы зоны
+    limits = [l for l in limits if zone_low <= l["price"] <= zone_high]
+
+    return limits
+
+
+def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
+                       round_nums, limits, broken_levels):
+    """График с зоной, уровнями и лимитками."""
+    try:
+        data   = k1[-80:]
+        n      = len(data)
+        opens  = [float(c[1]) for c in data]
+        highs  = [float(c[2]) for c in data]
+        lows   = [float(c[3]) for c in data]
+        closes = [float(c[4]) for c in data]
+        dvols  = [float(c[7]) for c in data]
+        times  = [datetime.utcfromtimestamp(int(c[0])/1000) for c in data]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
+                                        gridspec_kw={"height_ratios": [3, 1]},
+                                        facecolor="#0d1117")
+        ax1.set_facecolor("#0d1117")
+        ax2.set_facecolor("#0d1117")
+        w = 0.6
+
+        for i in range(n):
+            color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
+            ax1.plot([i, i], [lows[i], highs[i]], color=color, lw=0.8)
+            bh = abs(closes[i]-opens[i]) or (highs[i]-lows[i])*0.01
+            ax1.add_patch(Rectangle((i-w/2, min(opens[i], closes[i])), w, bh,
+                                     facecolor=color, edgecolor=color))
+            ax2.bar(i, dvols[i], color=color, width=w, alpha=0.85)
+
+        # Зона входа — закрашенная область
+        ax1.axhspan(zone_low, zone_high, alpha=0.12, color="#ffd700", zorder=2)
+        ax1.axhline(y=zone_high, color="#ffd700", lw=2.0, ls="-",  zorder=6,
+                    label=f"Зона верх {zone_high:.6g}")
+        ax1.axhline(y=zone_low,  color="#ffd700", lw=2.0, ls="--", zorder=6,
+                    label=f"Зона низ {zone_low:.6g}")
+
+        # Пробитые уровни (стек)
+        for lv in broken_levels:
+            if lv["price"] != zone_high and lv["price"] != zone_low:
+                ax1.axhline(y=lv["price"], color="#aaaaaa", lw=0.8, ls=":",
+                            alpha=0.6, zorder=4)
+                ax1.text(n-0.5, lv["price"],
+                         f" {lv['price']:.6g} [{lv['tf']}] {lv['hold_mins']}мин",
+                         color="#aaaaaa", fontsize=6, va="center")
+
+        # Внутренние уровни в зоне
+        for lv in inner_levels:
+            ax1.axhline(y=lv["price"], color="#ff8c00", lw=1.0, ls="--",
+                        alpha=0.8, zorder=5)
+            ax1.text(1, lv["price"],
+                     f" {lv['price']:.6g} [{lv['tf']}] слабый",
+                     color="#ff8c00", fontsize=6, va="center")
+
+        # Круглые числа в зоне
+        for r in round_nums:
+            ax1.axhline(y=r, color="#cc44ff", lw=0.8, ls=":",
+                        alpha=0.7, zorder=5)
+            ax1.text(3, r, f" {r:.6g} ○",
+                     color="#cc44ff", fontsize=6, va="center")
+
+        # Лимитки
+        limit_colors = ["#00ff88", "#00cc66", "#009944"]
+        for i, lm in enumerate(limits):
+            color = limit_colors[min(i, 2)]
+            ax1.axhline(y=lm["price"], color=color, lw=1.5, ls="-.",
+                        alpha=0.9, zorder=7)
+            ax1.text(n * 0.3, lm["price"],
+                     f" {lm['label']}: {lm['price']:.6g}",
+                     color=color, fontsize=7, va="bottom", fontweight="bold")
+
+        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: fmt_usd(x)))
+        ticks = list(range(0, n, max(1, n//6)))
+        for ax in [ax1, ax2]:
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([times[i].strftime("%H:%M") for i in ticks],
+                                color="#8b949e", fontsize=8)
+            ax.tick_params(colors="#8b949e", labelsize=8)
+            ax.yaxis.set_tick_params(labelcolor="#8b949e")
+            for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
+            ax.grid(color="#21262d", ls="--", lw=0.5)
+            ax.set_xlim(-1, n)
+
+        ax1.legend(loc="upper left", fontsize=7, facecolor="#161b22",
+                   edgecolor="#30363d", labelcolor="white", framealpha=0.8)
+        ax1.set_title(f"{symbol} · ИНПЛЕЙ · 1m", color="#e6edf3",
+                      fontsize=13, fontweight="bold", pad=8)
+        ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
+        ax2.set_ylabel("Vol USD", color="#8b949e", fontsize=9)
+        plt.tight_layout(pad=1.2)
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
+        plt.close(fig); buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"  [INPLAY CHART ERR {symbol}] {e}")
+        return None
+
+
+def build_inplay_alert(symbol, close, pump_pct, pump_mins,
+                       zone_low, zone_high, broken_levels,
+                       inner_levels, round_nums, limits,
+                       squeeze_prob, sq_details, natr, vol_mult_val,
+                       alert_type="inplay"):
+    """Строит сообщение инплей-алерта."""
+    coin      = symbol.replace("USDT", "")
+    zone_pct  = round((zone_high - zone_low) / zone_high * 100, 2)
+    dist_high = round((close - zone_high) / zone_high * 100, 2)
+    dist_low  = round((close - zone_low)  / zone_low  * 100, 2)
+
+    if alert_type == "inplay":
+        header = f"🚀 <code>{symbol}</code> · инплей +{pump_pct:.0f}% за {pump_mins}мин"
+    elif alert_type == "approach":
+        header = f"⚡️ <code>{symbol}</code> · цена идёт к зоне · −{abs(dist_high):.1f}% до входа"
+    elif alert_type == "zone_update":
+        header = f"🔄 <code>{symbol}</code> · зона обновлена (новый пробой)"
+    elif alert_type == "zone_broken":
+        header = f"🚨 <code>{symbol}</code> · ЗОНА ПРОБИТА · убирай лимитки!"
+    else:
+        header = f"📊 <code>{symbol}</code>"
+
+    lines = [
+        header,
+        "━━━━━━━━━━━━━━━━━━━",
+        f"Цена: <b>{close:.6g}</b>  NATR: {natr:.2f}%  Объём: {vol_mult_val:.1f}x",
+        "",
+        f"📦 Активная зона: <b>{zone_low:.6g} – {zone_high:.6g}</b> ({zone_pct}%)",
+        f"  ▲ <b>{zone_high:.6g}</b> [{broken_levels[-1]['tf'] if broken_levels else '?'}]"
+        f" · до цены: {dist_high:+.2f}%"
+        f" · держится {broken_levels[-1]['hold_mins'] if broken_levels else '?'}мин",
+        f"  ▼ <b>{zone_low:.6g}</b> [{broken_levels[-2]['tf'] if len(broken_levels)>=2 else '?'}]"
+        f" · до цены: {dist_low:+.2f}%",
+    ]
+
+    if inner_levels:
+        lines.append("")
+        lines.append("📍 Внутри зоны:")
+        for lv in inner_levels:
+            lines.append(f"  · {lv['price']:.6g} [{lv['tf']}] слабый уровень")
+
+    if round_nums:
+        rn_str = "  · " + " / ".join(f"{r:.6g}" for r in round_nums)
+        lines.append(f"🔵 Круглые числа в зоне:\n{rn_str}")
+
+    lines.append("")
+    lines.append("📌 Лимитки (лонг):")
+    for lm in limits:
+        lines.append(f"  <b>{lm['label']}: {lm['price']:.6g}</b>  ← {lm['reason']}")
+
+    lines.append("")
+    lines.append(f"🎯 Сквиз: вероятность {squeeze_prob}")
+    if sq_details["natr_squeeze"]:
+        lines.append(f"  NATR сжимается: {sq_details['natr_early']}% → {sq_details['natr_now']}%")
+    if sq_details["vol_declining"]:
+        lines.append(f"  Объём падает (накопление)")
+    lines.append(f"  CVD: {_cvd_str(sq_details['cvd'])}")
+    if sq_details["consolidating"]:
+        lines.append(f"  Консолидация у хая ✅")
+
+    if alert_type == "zone_broken":
+        lines.append("")
+        lines.append("⚠️ Нижняя граница пробита вниз на объёме")
+        lines.append("Убирай лимитки, следующая поддержка ниже")
+
+    lines.append(f"\n💎 <code>{coin}</code>")
+    return "\n".join(lines)
+
+
+def inplay_scan_symbol(symbol):
+    """
+    Проверяет символ на инплей-условия.
+    Возвращает данные или None.
+    """
+    # Загружаем свечи
+    k1  = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                {"symbol": symbol, "interval": "1m",  "limit": 120})
+    k5  = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                {"symbol": symbol, "interval": "5m",  "limit": 60})
+    k15 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                {"symbol": symbol, "interval": "15m", "limit": 30})
+
+    if not k1 or not k5 or len(k1) < 30 or len(k5) < 14:
+        return None
+
+    close = float(k1[-1][4])
+    natr  = calc_natr(k1)
+
+    # Фильтр NATR
+    if natr < INPLAY_NATR_MIN:
+        return None
+
+    # Памп от лоя за последние INPLAY_PUMP_MINS минут
+    window = k1[-INPLAY_PUMP_MINS:]
+    lows   = [float(c[3]) for c in window]
+    recent_low = min(lows)
+    pump_pct   = (close - recent_low) / recent_low * 100
+    pump_mins  = INPLAY_PUMP_MINS  # приблизительно
+
+    if pump_pct < INPLAY_PUMP_PCT:
+        return None
+
+    # Фильтр объёма
+    _, vol_mult_val = volume_mult(k5, lookback=12)
+    if vol_mult_val < INPLAY_VOL_MULT:
+        return None
+
+    # Абсолютный объём
+    recent_vol = float(k5[-2][7])
+    if recent_vol < MIN_VOL_5M_USD:
+        return None
+
+    # Находим пробитые уровни
+    broken = find_broken_levels(k1, k5, k15 or [], close)
+    if len(broken) < 2:
+        return None  # нужно минимум 2 уровня для зоны
+
+    # Активная зона: два верхних пробитых уровня под ценой
+    zone_high = broken[-1]["price"]
+    zone_low  = broken[-2]["price"]
+
+    # Внутренние уровни и круглые числа
+    inner  = find_inner_levels(k1, k5, zone_low, zone_high)
+    rounds = find_round_numbers_in_zone(zone_low, zone_high)
+
+    # Вероятность сквиза
+    sq_prob, sq_details = calc_squeeze_probability(k1, k5, zone_high, natr)
+
+    # Лимитки
+    limits = calc_squeeze_depth(zone_low, zone_high, inner, rounds, natr)
+
+    return {
+        "close":      close,
+        "natr":       natr,
+        "pump_pct":   round(pump_pct, 1),
+        "pump_mins":  pump_mins,
+        "vol_mult":   vol_mult_val,
+        "broken":     broken,
+        "zone_high":  zone_high,
+        "zone_low":   zone_low,
+        "inner":      inner,
+        "rounds":     rounds,
+        "sq_prob":    sq_prob,
+        "sq_details": sq_details,
+        "limits":     limits,
+        "k1":         k1,
+    }
+
+
+def can_inplay_alert(symbol, alert_type, cooldown=120):
+    now = time.time()
+    key = f"{symbol}_{alert_type}"
+    if now - inplay_alert_cache.get(key, 0) >= cooldown:
+        inplay_alert_cache[key] = now
+        return True
+    return False
+
+
+def inplay_loop(symbols_ref):
+    """Бесконечный цикл инплей-модуля."""
+    print("  [IP] Инплей модуль запущен")
+    while True:
+        start   = time.time()
+        symbols = symbols_ref[0]
+        if not symbols:
+            time.sleep(INPLAY_SCAN_SEC)
+            continue
+
+        def process_inplay(sym):
+            try:
+                data = inplay_scan_symbol(sym)
+
+                with inplay_lock:
+                    prev = inplay_coins.get(sym)
+
+                if data is None:
+                    # Проверяем пробой зоны если монета была в наблюдении
+                    if prev and not prev.get("zone_broken_alerted"):
+                        k1_q = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                                     {"symbol": sym, "interval": "1m", "limit": 10})
+                        if k1_q:
+                            cur = float(k1_q[-1][4])
+                            if cur < prev["zone_low"] * 0.998:  # пробой нижней границы
+                                msg = build_inplay_alert(
+                                    sym, cur, prev["pump_pct"], prev["pump_mins"],
+                                    prev["zone_low"], prev["zone_high"],
+                                    prev["broken"], prev["inner"], prev["rounds"],
+                                    prev["limits"], prev["sq_prob"], prev["sq_details"],
+                                    prev["natr"], prev["vol_mult"],
+                                    alert_type="zone_broken"
+                                )
+                                send_message(msg)
+                                print(f"  [IP] 🚨 {sym} зона пробита")
+                                with inplay_lock:
+                                    if sym in inplay_coins:
+                                        inplay_coins[sym]["zone_broken_alerted"] = True
+                    return
+
+                close     = data["close"]
+                zone_high = data["zone_high"]
+                zone_low  = data["zone_low"]
+
+                # Алерт 1: новая инплей монета
+                if prev is None:
+                    if can_inplay_alert(sym, "inplay", cooldown=300):
+                        caption = build_inplay_alert(
+                            sym, close, data["pump_pct"], data["pump_mins"],
+                            zone_low, zone_high, data["broken"],
+                            data["inner"], data["rounds"], data["limits"],
+                            data["sq_prob"], data["sq_details"],
+                            data["natr"], data["vol_mult"],
+                            alert_type="inplay"
+                        )
+                        chart = build_inplay_chart(
+                            sym, data["k1"], zone_low, zone_high,
+                            data["inner"], data["rounds"], data["limits"],
+                            data["broken"]
+                        )
+                        if chart: send_photo(chart, caption)
+                        else:     send_message(caption)
+                        print(f"  [IP] 🚀 {sym} инплей +{data['pump_pct']}%")
+
+                    with inplay_lock:
+                        inplay_coins[sym] = {**data, "since": time.time(),
+                                             "zone_broken_alerted": False,
+                                             "last_approach_alert": 0}
+
+                else:
+                    # Алерт 2: зона обновилась (новый пробой)
+                    if (abs(zone_high - prev["zone_high"]) / prev["zone_high"] * 100 > 0.3 or
+                        abs(zone_low  - prev["zone_low"])  / prev["zone_low"]  * 100 > 0.3):
+                        if can_inplay_alert(sym, "zone_update", cooldown=120):
+                            caption = build_inplay_alert(
+                                sym, close, data["pump_pct"], data["pump_mins"],
+                                zone_low, zone_high, data["broken"],
+                                data["inner"], data["rounds"], data["limits"],
+                                data["sq_prob"], data["sq_details"],
+                                data["natr"], data["vol_mult"],
+                                alert_type="zone_update"
+                            )
+                            chart = build_inplay_chart(
+                                sym, data["k1"], zone_low, zone_high,
+                                data["inner"], data["rounds"], data["limits"],
+                                data["broken"]
+                            )
+                            if chart: send_photo(chart, caption)
+                            else:     send_message(caption)
+                            print(f"  [IP] 🔄 {sym} зона обновлена")
+
+                    # Алерт 3: цена идёт к зоне
+                    dist_to_zone = (close - zone_high) / zone_high * 100
+                    now = time.time()
+                    last_approach = prev.get("last_approach_alert", 0)
+                    if (0 < dist_to_zone <= ZONE_APPROACH_PCT and
+                            now - last_approach > 180):
+                        caption = build_inplay_alert(
+                            sym, close, data["pump_pct"], data["pump_mins"],
+                            zone_low, zone_high, data["broken"],
+                            data["inner"], data["rounds"], data["limits"],
+                            data["sq_prob"], data["sq_details"],
+                            data["natr"], data["vol_mult"],
+                            alert_type="approach"
+                        )
+                        chart = build_inplay_chart(
+                            sym, data["k1"], zone_low, zone_high,
+                            data["inner"], data["rounds"], data["limits"],
+                            data["broken"]
+                        )
+                        if chart: send_photo(chart, caption)
+                        else:     send_message(caption)
+                        print(f"  [IP] ⚡ {sym} идёт к зоне dist={dist_to_zone:.1f}%")
+
+                    with inplay_lock:
+                        inplay_coins[sym] = {**data, "since": prev.get("since", time.time()),
+                                             "zone_broken_alerted": False,
+                                             "last_approach_alert": now if 0 < dist_to_zone <= ZONE_APPROACH_PCT else last_approach}
+
+            except Exception as e:
+                print(f"  [IP ERR {sym}] {e}")
+
+        # Убираем протухшие
+        now = time.time()
+        with inplay_lock:
+            expired = [s for s, v in inplay_coins.items()
+                       if now - v.get("since", 0) > INPLAY_TTL]
+            for s in expired:
+                del inplay_coins[s]
+                print(f"  [IP] ⏰ {s} убран из инплей")
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            list(pool.map(process_inplay, symbols))
+
+        elapsed = time.time() - start
+        time.sleep(max(0, INPLAY_SCAN_SEC - elapsed))
+
+
+# ─────────────────────────────────────────────
 #  ГЛАВНЫЙ ЗАПУСК
 # ─────────────────────────────────────────────
 
@@ -1005,6 +1645,9 @@ def main():
 
     # Слой 2 в отдельном потоке
     threading.Thread(target=layer2_loop, daemon=True).start()
+
+    # Инплей модуль в отдельном потоке
+    threading.Thread(target=inplay_loop, args=(symbols_ref,), daemon=True).start()
 
     # Слой 1 — основной поток
     layer1_loop(symbols_ref)
