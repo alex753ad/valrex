@@ -82,13 +82,12 @@ active_lock  = threading.Lock()
 alert_cache: dict  = {}
 alert_lock   = threading.Lock()
 
-# Инплей: { symbol: { "since", "pump_pct", "levels_stack", "zone", "state",
-#                     "last_alert", "last_zone_alert", "zone_broken_alerted" } }
+# Инплей
 inplay_coins: dict = {}
 inplay_lock   = threading.Lock()
 inplay_alert_cache: dict = {}
 
-
+proxy_lock   = threading.Lock()
 current_proxy = {"http": None, "https": None}
 PROXY_LIST: list = []
 
