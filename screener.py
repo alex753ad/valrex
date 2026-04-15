@@ -1110,6 +1110,201 @@ def find_inner_levels(k1, k5, zone_low, zone_high):
     return deduped
 
 
+def get_open_interest(symbol):
+    """Получает историю OI за последние 30 минут (5m свечи)."""
+    data = fetch("https://fapi.binance.com/futures/data/openInterestHist",
+                 {"symbol": symbol, "period": "5m", "limit": 10})
+    if not data or len(data) < 3:
+        return None
+    return data
+
+
+def calc_oi_signal(oi_data, pump_pct):
+    """
+    Анализирует OI относительно пампа.
+    Возвращает (score_delta, oi_str, oi_details).
+    """
+    if not oi_data or len(oi_data) < 3:
+        return 0, "⚪ нет данных", {}
+
+    oi_values = [float(d["sumOpenInterest"]) for d in oi_data]
+    oi_start  = oi_values[0]
+    oi_now    = oi_values[-1]
+    oi_change = (oi_now - oi_start) / oi_start * 100 if oi_start > 0 else 0
+
+    # OI у зоны — последние 3 свечи
+    oi_zone_trend = oi_values[-3:]
+    oi_holding = oi_zone_trend[-1] >= oi_zone_trend[-2] * 0.98  # не падает
+    oi_falling  = oi_zone_trend[-1] < oi_zone_trend[-2] * 0.95  # активно падает
+
+    score = 0
+    flags = []
+
+    if oi_change < 10:
+        score -= 3
+        flags.append(f"⚠️ OI не рос при пампе ({oi_change:+.1f}%) — шортокрыл")
+    elif oi_change > 100:
+        score -= 2
+        flags.append(f"⚠️ OI перегрет ({oi_change:+.1f}%) — лонги под риском")
+    elif 10 <= oi_change <= 60:
+        score += 2
+        flags.append(f"✅ OI органичный ({oi_change:+.1f}%)")
+    else:  # 60-100
+        score += 1
+        flags.append(f"🟡 OI повышен ({oi_change:+.1f}%)")
+
+    if oi_holding:
+        score += 2
+        flags.append("✅ OI держится у зоны (лонги не сдались)")
+    elif oi_falling:
+        score -= 2
+        flags.append("⚠️ OI падает у зоны (ликвидации идут)")
+
+    oi_str = f"{oi_change:+.1f}% · " + flags[0].split("—")[0].strip() if flags else ""
+    return score, oi_str, {
+        "change":   round(oi_change, 1),
+        "holding":  oi_holding,
+        "falling":  oi_falling,
+        "flags":    flags,
+        "score":    score,
+    }
+
+
+def detect_peak_consolidation(k1, natr):
+    """
+    Определяет есть ли проторговка на пике.
+    Ищет последние N свечей 1m у хая с маленьким телом.
+    Возвращает (есть_проторговка, минуты, score_delta, описание).
+    """
+    if len(k1) < 10:
+        return False, 0, 0, "недостаточно данных"
+
+    closes = [float(c[4]) for c in k1]
+    highs  = [float(c[2]) for c in k1]
+    bodies = [abs(float(c[4]) - float(c[1])) / float(c[2]) * 100
+              for c in k1 if float(c[2]) > 0]
+
+    # Находим пик (хай последних 30 свечей)
+    peak_idx = highs[-30:].index(max(highs[-30:])) + (len(highs) - 30)
+    candles_since_peak = len(k1) - 1 - peak_idx
+
+    if candles_since_peak < 1:
+        return False, 0, -3, "только что пик — проторговки нет"
+
+    # Свечи на пике (±2 свечи от хая)
+    peak_window = k1[max(0, peak_idx-1): peak_idx+3]
+    if not peak_window:
+        return False, 0, -3, "нет свечей у пика"
+
+    # Средний размер тела на пике
+    peak_bodies = [abs(float(c[4]) - float(c[1])) / ((float(c[2]) + float(c[3])) / 2) * 100
+                   for c in peak_window]
+    avg_peak_body = sum(peak_bodies) / len(peak_bodies) if peak_bodies else natr
+
+    # Диапазон хай-лоу в окне пика
+    peak_highs = [float(c[2]) for c in peak_window]
+    peak_lows  = [float(c[3]) for c in peak_window]
+    peak_range = (max(peak_highs) - min(peak_lows)) / max(peak_highs) * 100 if peak_highs else natr
+
+    # Нарастание импульса (свечи становятся крупнее)
+    last5_bodies = bodies[-5:] if len(bodies) >= 5 else bodies
+    prev5_bodies = bodies[-10:-5] if len(bodies) >= 10 else bodies[:5]
+    avg_last = sum(last5_bodies) / len(last5_bodies) if last5_bodies else 0
+    avg_prev = sum(prev5_bodies) / len(prev5_bodies) if prev5_bodies else 0
+    impulse_growing = avg_last > avg_prev * 1.3
+
+    # Проторговка = диапазон пика < 0.5 * NATR и хотя бы 2 мин
+    flat_at_peak = peak_range < natr * 0.5 and candles_since_peak >= 2
+    consol_mins  = candles_since_peak if flat_at_peak else 0
+
+    if flat_at_peak and consol_mins >= 5:
+        score = +3
+        desc  = f"✅ Проторговка {consol_mins}мин на пике (диапазон {peak_range:.2f}%)"
+    elif flat_at_peak and consol_mins >= 2:
+        score = +1
+        desc  = f"🟡 Короткая проторговка {consol_mins}мин (диапазон {peak_range:.2f}%)"
+    elif impulse_growing:
+        score = -3
+        desc  = f"🔴 Нарастающий импульс без проторговки — пробой вероятен"
+    else:
+        score = -2
+        desc  = f"⚠️ Нет проторговки на пике — риск вертикального слива"
+
+    return flat_at_peak, consol_mins, score, desc
+
+
+def calc_zone_quality(k1, k5, natr, zone_high, zone_low,
+                      broken_levels, oi_score, peak_score):
+    """
+    Zone Quality Score 0–10.
+    Агрегирует все факторы надёжности зоны.
+    """
+    zone_pct = (zone_high - zone_low) / zone_high * 100
+    score    = 5.0  # базовый
+    flags    = []
+
+    # NATR vs зона
+    ratio = natr / zone_pct if zone_pct > 0 else 99
+    if ratio < 0.5:
+        score += 3; flags.append("✅ NATR << зона (зона широкая)")
+    elif ratio < 1.0:
+        score += 1; flags.append("✅ NATR < зона")
+    elif ratio < 1.5:
+        score -= 1; flags.append("🟡 NATR ≈ зона")
+    else:
+        score -= 3; flags.append(f"🔴 NATR ({natr:.1f}%) в {ratio:.1f}x больше зоны — одна свеча перекрывает зону")
+
+    # Верхний уровень (hold_mins)
+    top_hold = broken_levels[-1]["hold_mins"] if broken_levels else 0
+    if top_hold >= 15:
+        score += 2; flags.append(f"✅ Верхний уровень держится {top_hold}мин")
+    elif top_hold >= 5:
+        score += 1; flags.append(f"🟡 Верхний уровень держится {top_hold}мин")
+    else:
+        score -= 2; flags.append(f"🔴 Верхний уровень держится {top_hold}мин (не тестирован)")
+
+    # Нижний уровень
+    bot_hold = broken_levels[-2]["hold_mins"] if len(broken_levels) >= 2 else 0
+    if bot_hold >= 15:
+        score += 2; flags.append(f"✅ Нижний уровень держится {bot_hold}мин")
+    elif bot_hold >= 5:
+        score += 1
+
+    # Паузы в пампе (консолидации)
+    closes_1m = [float(c[4]) for c in k1[-30:]]
+    natr_slices = []
+    for i in range(0, len(closes_1m)-4, 3):
+        sl = closes_1m[i:i+4]
+        rng = (max(sl)-min(sl))/min(sl)*100 if min(sl) > 0 else 0
+        natr_slices.append(rng)
+    pauses = sum(1 for s in natr_slices if s < natr * 0.5)
+    if pauses >= 2:
+        score += 2; flags.append(f"✅ Пауз в пампе: {pauses} (структура)")
+    elif pauses == 0:
+        score -= 2; flags.append("🔴 Нет пауз в пампе — вертикальный памп")
+
+    # OI и пик
+    score += oi_score
+    score += peak_score
+
+    score = max(0, min(10, round(score)))
+
+    if score >= 8:
+        verdict = "🟢 НАДЁЖНАЯ · полный объём"
+        rec_pct = 100
+    elif score >= 6:
+        verdict = "🟡 УМЕРЕННАЯ · 50% объёма, стоп обязателен"
+        rec_pct = 50
+    elif score >= 4:
+        verdict = "🟠 СЛАБАЯ · 25% объёма, только резерв"
+        rec_pct = 25
+    else:
+        verdict = "🔴 ОПАСНО · не заходить"
+        rec_pct = 0
+
+    return score, verdict, rec_pct, flags
+
+
 def calc_squeeze_probability(k1, k5, zone_high, natr):
     """
     Оценивает вероятность сквиза к зоне.
@@ -1119,19 +1314,19 @@ def calc_squeeze_probability(k1, k5, zone_high, natr):
     vols_1m   = [float(c[7]) for c in k1[-20:]]
 
     # NATR сжимается?
-    natr_early = calc_natr(k1[-30:-10]) if len(k1) >= 30 else natr
-    natr_now   = calc_natr(k1[-10:])   if len(k1) >= 10 else natr
+    natr_early   = calc_natr(k1[-30:-10]) if len(k1) >= 30 else natr
+    natr_now     = calc_natr(k1[-10:])   if len(k1) >= 10 else natr
     natr_squeeze = natr_early > 0 and (natr_now / natr_early) < 0.75
 
     # Объём снижается (накопление)?
-    vol_early = sum(vols_1m[:10]) / 10 if len(vols_1m) >= 10 else 0
-    vol_now   = sum(vols_1m[-5:]) / 5  if len(vols_1m) >= 5  else 0
+    vol_early    = sum(vols_1m[:10]) / 10 if len(vols_1m) >= 10 else 0
+    vol_now      = sum(vols_1m[-5:]) / 5  if len(vols_1m) >= 5  else 0
     vol_declining = vol_now < vol_early * 0.7
 
     # CVD держится положительным
     cvd = calc_cvd(k1)
 
-    # Цена консолидирует у хая (последние 5 свечей в диапазоне < NATR)
+    # Цена консолидирует у хая
     recent_closes = closes_1m[-5:]
     rng = (max(recent_closes) - min(recent_closes)) / min(recent_closes) * 100 if recent_closes else 0
     consolidating = rng < natr
@@ -1323,6 +1518,8 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
                        zone_low, zone_high, broken_levels,
                        inner_levels, round_nums, limits,
                        squeeze_prob, sq_details, natr, vol_mult_val,
+                       oi_str, oi_details, peak_desc,
+                       zq_score, zq_verdict, rec_pct, zq_flags,
                        alert_type="inplay"):
     """Строит сообщение инплей-алерта."""
     coin      = symbol.replace("USDT", "")
@@ -1346,7 +1543,7 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
         "━━━━━━━━━━━━━━━━━━━",
         f"Цена: <b>{close:.6g}</b>  NATR: {natr:.2f}%  Объём: {vol_mult_val:.1f}x",
         "",
-        f"📦 Активная зона: <b>{zone_low:.6g} – {zone_high:.6g}</b> ({zone_pct}%)",
+        f"📦 Зона: <b>{zone_low:.6g} – {zone_high:.6g}</b> ({zone_pct}%)",
         f"  ▲ <b>{zone_high:.6g}</b> [{broken_levels[-1]['tf'] if broken_levels else '?'}]"
         f" · до цены: {dist_high:+.2f}%"
         f" · держится {broken_levels[-1]['hold_mins'] if broken_levels else '?'}мин",
@@ -1355,45 +1552,58 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
     ]
 
     if inner_levels:
-        lines.append("")
-        lines.append("📍 Внутри зоны:")
-        for lv in inner_levels:
-            lines.append(f"  · {lv['price']:.6g} [{lv['tf']}] слабый уровень")
-
+        lines.append("  📍 Внутри: " + ", ".join(
+            f"{lv['price']:.6g}[{lv['tf']}]" for lv in inner_levels))
     if round_nums:
-        rn_str = "  · " + " / ".join(f"{r:.6g}" for r in round_nums)
-        lines.append(f"🔵 Круглые числа в зоне:\n{rn_str}")
+        lines.append("  🔵 Круглые: " + " / ".join(f"{r:.6g}" for r in round_nums))
 
+    # ── ZONE QUALITY SCORE ──
     lines.append("")
-    lines.append("📌 Лимитки (лонг):")
-    for lm in limits:
-        lines.append(f"  <b>{lm['label']}: {lm['price']:.6g}</b>  ← {lm['reason']}")
+    lines.append(f"🛡 Надёжность зоны: <b>{zq_score}/10</b> — {zq_verdict}")
+    for flag in zq_flags[:4]:  # топ-4 фактора
+        lines.append(f"  {flag}")
 
+    # OI
+    if oi_str:
+        lines.append(f"📊 OI: {oi_str}")
+        if oi_details.get("flags"):
+            for f in oi_details["flags"][1:2]:  # второй флаг если есть
+                lines.append(f"  {f}")
+
+    # Пик
+    lines.append(f"🏔 Пик: {peak_desc}")
+
+    # Рекомендация по объёму
     lines.append("")
-    lines.append(f"🎯 Сквиз: вероятность {squeeze_prob}")
+    if rec_pct == 0:
+        lines.append("📌 <b>Рекомендация: НЕ ЗАХОДИТЬ</b>")
+    else:
+        lines.append(f"📌 <b>Рекомендация: {rec_pct}% от объёма</b>")
+        lines.append("Лимитки (лонг):")
+        for lm in limits:
+            lines.append(f"  <b>{lm['label']}: {lm['price']:.6g}</b>  ← {lm['reason']}")
+
+    # Сквиз
+    lines.append("")
+    lines.append(f"🎯 Сквиз: {squeeze_prob}")
     if sq_details["natr_squeeze"]:
         lines.append(f"  NATR сжимается: {sq_details['natr_early']}% → {sq_details['natr_now']}%")
     if sq_details["vol_declining"]:
-        lines.append(f"  Объём падает (накопление)")
-    lines.append(f"  CVD: {_cvd_str(sq_details['cvd'])}")
+        lines.append("  Объём падает (накопление) ✅")
     if sq_details["consolidating"]:
-        lines.append(f"  Консолидация у хая ✅")
+        lines.append("  Консолидирует у хая ✅")
 
     if alert_type == "zone_broken":
         lines.append("")
         lines.append("⚠️ Нижняя граница пробита вниз на объёме")
-        lines.append("Убирай лимитки, следующая поддержка ниже")
+        lines.append("Убирай лимитки · следующая поддержка ниже")
 
     lines.append(f"\n💎 <code>{coin}</code>")
     return "\n".join(lines)
 
 
 def inplay_scan_symbol(symbol):
-    """
-    Проверяет символ на инплей-условия.
-    Возвращает данные или None.
-    """
-    # Загружаем свечи
+    """Проверяет символ на инплей-условия. Возвращает данные или None."""
     k1  = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                 {"symbol": symbol, "interval": "1m",  "limit": 120})
     k5  = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
@@ -1407,47 +1617,49 @@ def inplay_scan_symbol(symbol):
     close = float(k1[-1][4])
     natr  = calc_natr(k1)
 
-    # Фильтр NATR
     if natr < INPLAY_NATR_MIN:
         return None
 
     # Памп от лоя за последние INPLAY_PUMP_MINS минут
-    window = k1[-INPLAY_PUMP_MINS:]
-    lows   = [float(c[3]) for c in window]
+    window     = k1[-INPLAY_PUMP_MINS:]
+    lows       = [float(c[3]) for c in window]
     recent_low = min(lows)
     pump_pct   = (close - recent_low) / recent_low * 100
-    pump_mins  = INPLAY_PUMP_MINS  # приблизительно
+    pump_mins  = INPLAY_PUMP_MINS
 
     if pump_pct < INPLAY_PUMP_PCT:
         return None
 
-    # Фильтр объёма
     _, vol_mult_val = volume_mult(k5, lookback=12)
     if vol_mult_val < INPLAY_VOL_MULT:
         return None
 
-    # Абсолютный объём
-    recent_vol = float(k5[-2][7])
-    if recent_vol < MIN_VOL_5M_USD:
+    if float(k5[-2][7]) < MIN_VOL_5M_USD:
         return None
 
-    # Находим пробитые уровни
     broken = find_broken_levels(k1, k5, k15 or [], close)
     if len(broken) < 2:
-        return None  # нужно минимум 2 уровня для зоны
+        return None
 
-    # Активная зона: два верхних пробитых уровня под ценой
     zone_high = broken[-1]["price"]
     zone_low  = broken[-2]["price"]
+    inner     = find_inner_levels(k1, k5, zone_low, zone_high)
+    rounds    = find_round_numbers_in_zone(zone_low, zone_high)
 
-    # Внутренние уровни и круглые числа
-    inner  = find_inner_levels(k1, k5, zone_low, zone_high)
-    rounds = find_round_numbers_in_zone(zone_low, zone_high)
+    # OI анализ
+    oi_data              = get_open_interest(symbol)
+    oi_score, oi_str, oi_details = calc_oi_signal(oi_data, pump_pct)
 
-    # Вероятность сквиза
+    # Детектор проторговки на пике
+    peak_flat, peak_mins, peak_score, peak_desc = detect_peak_consolidation(k1, natr)
+
+    # Zone Quality Score
+    zq_score, zq_verdict, rec_pct, zq_flags = calc_zone_quality(
+        k1, k5, natr, zone_high, zone_low,
+        broken, oi_score, peak_score
+    )
+
     sq_prob, sq_details = calc_squeeze_probability(k1, k5, zone_high, natr)
-
-    # Лимитки
     limits = calc_squeeze_depth(zone_low, zone_high, inner, rounds, natr)
 
     return {
@@ -1464,6 +1676,15 @@ def inplay_scan_symbol(symbol):
         "sq_prob":    sq_prob,
         "sq_details": sq_details,
         "limits":     limits,
+        "oi_str":     oi_str,
+        "oi_details": oi_details,
+        "peak_flat":  peak_flat,
+        "peak_mins":  peak_mins,
+        "peak_desc":  peak_desc,
+        "zq_score":   zq_score,
+        "zq_verdict": zq_verdict,
+        "rec_pct":    rec_pct,
+        "zq_flags":   zq_flags,
         "k1":         k1,
     }
 
@@ -1508,6 +1729,8 @@ def inplay_loop(symbols_ref):
                                     prev["broken"], prev["inner"], prev["rounds"],
                                     prev["limits"], prev["sq_prob"], prev["sq_details"],
                                     prev["natr"], prev["vol_mult"],
+                                    prev["oi_str"], prev["oi_details"], prev["peak_desc"],
+                                    prev["zq_score"], prev["zq_verdict"], prev["rec_pct"], prev["zq_flags"],
                                     alert_type="zone_broken"
                                 )
                                 send_message(msg)
@@ -1530,6 +1753,8 @@ def inplay_loop(symbols_ref):
                             data["inner"], data["rounds"], data["limits"],
                             data["sq_prob"], data["sq_details"],
                             data["natr"], data["vol_mult"],
+                            data["oi_str"], data["oi_details"], data["peak_desc"],
+                            data["zq_score"], data["zq_verdict"], data["rec_pct"], data["zq_flags"],
                             alert_type="inplay"
                         )
                         chart = build_inplay_chart(
@@ -1557,6 +1782,8 @@ def inplay_loop(symbols_ref):
                                 data["inner"], data["rounds"], data["limits"],
                                 data["sq_prob"], data["sq_details"],
                                 data["natr"], data["vol_mult"],
+                                data["oi_str"], data["oi_details"], data["peak_desc"],
+                                data["zq_score"], data["zq_verdict"], data["rec_pct"], data["zq_flags"],
                                 alert_type="zone_update"
                             )
                             chart = build_inplay_chart(
@@ -1580,6 +1807,8 @@ def inplay_loop(symbols_ref):
                             data["inner"], data["rounds"], data["limits"],
                             data["sq_prob"], data["sq_details"],
                             data["natr"], data["vol_mult"],
+                            data["oi_str"], data["oi_details"], data["peak_desc"],
+                            data["zq_score"], data["zq_verdict"], data["rec_pct"], data["zq_flags"],
                             alert_type="approach"
                         )
                         chart = build_inplay_chart(
