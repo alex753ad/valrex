@@ -660,8 +660,8 @@ def layer1_loop(symbols_ref):
                 }
 
             if not already_active:
-                msg = build_layer1_alert(sym, mult, trigger)
-                send_message(msg)
+                # Слой 1 работает молча — только добавляет монету в наблюдение
+                # Уведомление придёт только от Слоя 3 при реальном касании уровня
                 print(f"  [L1] 🔥 {sym} | {trigger} | {mult:.1f}x | imp_close={imp_close:.6g}")
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -755,22 +755,8 @@ def detect_pullback(symbol, state, k1):
                     with active_lock:
                         if symbol in active_coins:
                             active_coins[symbol]["pullback_high"] = recent_high
-                    msg = (
-                        f"📉 <code>{symbol}</code> — откат от хая\n"
-                        f"━━━━━━━━━━━━━━━━━━━\n"
-                        f"Хай: <b>{recent_high:.6g}</b> → цена: <b>{close:.6g}</b> (−{drop_pct:.1f}%)\n"
-                        f"Идёт к поддержке: <b>{nearest['price']:.6g}</b> [{nearest['tf']}]\n"
-                        f"Расстояние: <b>{dist_to_lv:.2f}%</b> · NATR: {natr:.2f}%\n"
-                        f"━━━━━━━━━━━━━━━━━━━\n"
-                        f"⏳ Готовь лимит у уровня · следующий алерт при касании"
-                    )
-                    send_message(msg)
+                    # Откат отслеживается внутренне — уведомление придёт при касании уровня
                     print(f"  [PB] 📉 {symbol} откат {drop_pct:.1f}% → поддержка {nearest['price']:.6g}")
-
-    # ── ОТСКОК ОТ ЛОЯ (дамп → цена растёт к сопротивлению) ──
-    recent_low  = min(lows[-10:])
-    rise_pct    = (close - recent_low) / recent_low * 100
-    going_up    = closes[-1] > closes[-2] and closes[-2] > closes[-3]
 
     if rise_pct >= natr * 0.5 and going_up:
         res_levels = [lv for lv in levels if lv["type"] == "res" and lv["price"] > close]
@@ -783,16 +769,7 @@ def detect_pullback(symbol, state, k1):
                     with active_lock:
                         if symbol in active_coins:
                             active_coins[symbol]["pullback_low"] = recent_low
-                    msg = (
-                        f"📈 <code>{symbol}</code> — отскок от лоя\n"
-                        f"━━━━━━━━━━━━━━━━━━━\n"
-                        f"Лой: <b>{recent_low:.6g}</b> → цена: <b>{close:.6g}</b> (+{rise_pct:.1f}%)\n"
-                        f"Идёт к сопротивлению: <b>{nearest['price']:.6g}</b> [{nearest['tf']}]\n"
-                        f"Расстояние: <b>{dist_to_lv:.2f}%</b> · NATR: {natr:.2f}%\n"
-                        f"━━━━━━━━━━━━━━━━━━━\n"
-                        f"⏳ Готовь лимит у уровня · следующий алерт при касании"
-                    )
-                    send_message(msg)
+                    # Отскок отслеживается внутренне — уведомление придёт при касании уровня
                     print(f"  [PB] 📈 {symbol} отскок {rise_pct:.1f}% → сопротивление {nearest['price']:.6g}")
 
 
@@ -1641,6 +1618,20 @@ def inplay_scan_symbol(symbol):
     if len(broken) < 2:
         return None
 
+    # Верхний уровень должен держаться минимум 10 мин
+    if broken[-1]["hold_mins"] < 10:
+        return None
+
+    # Фильтр "памп завершён" — скорость роста последних 5 мин < 50% от пиковой
+    closes_1m  = [float(c[4]) for c in k1]
+    speeds     = [abs(closes_1m[i] - closes_1m[i-5]) / closes_1m[i-5] * 100
+                  for i in range(5, len(closes_1m)) if closes_1m[i-5] > 0]
+    if len(speeds) >= 6:
+        peak_speed = max(speeds[:-3]) if len(speeds) > 3 else max(speeds)
+        curr_speed = sum(speeds[-3:]) / 3
+        if peak_speed > 0 and curr_speed > peak_speed * 0.5:
+            return None  # памп ещё идёт, зона преждевременна
+
     zone_high = broken[-1]["price"]
     zone_low  = broken[-2]["price"]
     inner     = find_inner_levels(k1, k5, zone_low, zone_high)
@@ -1764,6 +1755,10 @@ def inplay_loop(symbols_ref):
                         )
                         if chart: send_photo(chart, caption)
                         else:     send_message(caption)
+                        # Регистрируем сигнал для контроля
+                        register_signal(sym, zone_low, zone_high,
+                                        data["zq_score"], data["zq_verdict"],
+                                        data["rec_pct"], close)
                         print(f"  [IP] 🚀 {sym} инплей +{data['pump_pct']}%")
 
                     with inplay_lock:
@@ -1845,6 +1840,276 @@ def inplay_loop(symbols_ref):
 
 
 # ─────────────────────────────────────────────
+#  СИСТЕМА КОНТРОЛЯ СИГНАЛОВ И СТАТИСТИКА
+# ─────────────────────────────────────────────
+
+import json
+
+STATS_FILE = "/tmp/signal_stats.json"
+
+# Структура записи: { id, symbol, time, zone_low, zone_high, zq_score,
+#                    zq_verdict, rec_pct, close_at_signal,
+#                    result: None | "hit_zone"/"bounced"/"broke_zone"/"no_touch",
+#                    result_time, result_close, result_pct }
+signal_tracker: dict = {}
+tracker_lock = threading.Lock()
+
+
+def load_stats():
+    global signal_tracker
+    try:
+        with open(STATS_FILE, "r") as f:
+            signal_tracker = json.load(f)
+    except Exception:
+        signal_tracker = {}
+
+
+def save_stats():
+    try:
+        with open(STATS_FILE, "w") as f:
+            json.dump(signal_tracker, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  [STATS] Ошибка сохранения: {e}")
+
+
+def register_signal(symbol, zone_low, zone_high, zq_score, zq_verdict,
+                    rec_pct, close_now):
+    """Регистрирует новый сигнал для последующего контроля."""
+    sid = f"{symbol}_{int(time.time())}"
+    entry = {
+        "id":             sid,
+        "symbol":         symbol,
+        "time":           datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "zone_low":       zone_low,
+        "zone_high":      zone_high,
+        "zq_score":       zq_score,
+        "zq_verdict":     zq_verdict,
+        "rec_pct":        rec_pct,
+        "close_at_signal": close_now,
+        "result":         None,
+        "result_time":    None,
+        "result_close":   None,
+        "result_detail":  None,
+    }
+    with tracker_lock:
+        signal_tracker[sid] = entry
+    save_stats()
+    return sid
+
+
+def check_signal_results():
+    """
+    Проверяет результаты незакрытых сигналов.
+    Запускается каждые 2 минуты.
+    """
+    now = time.time()
+    with tracker_lock:
+        pending = {sid: s for sid, s in signal_tracker.items()
+                   if s["result"] is None}
+
+    for sid, sig in pending.items():
+        symbol    = sig["symbol"]
+        zone_low  = sig["zone_low"]
+        zone_high = sig["zone_high"]
+        signal_ts = time.mktime(datetime.strptime(sig["time"], "%Y-%m-%d %H:%M").timetuple())
+
+        # Сигнал старше 4 часов — закрываем как "no_touch"
+        if now - signal_ts > 14400:
+            with tracker_lock:
+                signal_tracker[sid]["result"]       = "no_touch"
+                signal_tracker[sid]["result_time"]  = datetime.now().strftime("%H:%M")
+                signal_tracker[sid]["result_detail"] = "Зона не была достигнута за 4ч"
+            save_stats()
+            _send_result_alert(signal_tracker[sid])
+            continue
+
+        k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                   {"symbol": symbol, "interval": "1m", "limit": 10})
+        if not k1:
+            continue
+
+        close = float(k1[-1][4])
+        pct   = (close - sig["close_at_signal"]) / sig["close_at_signal"] * 100
+
+        result = None
+        detail = None
+
+        if zone_low <= close <= zone_high:
+            # Цена в зоне
+            result = "hit_zone"
+            detail = f"Цена вошла в зону · текущая: {close:.6g} ({pct:+.1f}%)"
+        elif close < zone_low * 0.998:
+            # Пробой зоны вниз
+            result = "broke_zone"
+            detail = f"Зона пробита вниз · {close:.6g} ({pct:+.1f}%) · убирай лимитки"
+        elif close > zone_high * 1.02 and pct > 3:
+            # Отскок от зоны вверх (зона сработала)
+            result = "bounced"
+            detail = f"Отскок от зоны вверх · {close:.6g} ({pct:+.1f}%) · зона держала"
+
+        if result:
+            with tracker_lock:
+                signal_tracker[sid]["result"]       = result
+                signal_tracker[sid]["result_time"]  = datetime.now().strftime("%H:%M")
+                signal_tracker[sid]["result_close"] = close
+                signal_tracker[sid]["result_detail"] = detail
+            save_stats()
+            _send_result_alert(signal_tracker[sid])
+
+
+def _send_result_alert(sig):
+    """Отправляет результат отработки сигнала."""
+    result = sig["result"]
+    symbol = sig["symbol"]
+    coin   = symbol.replace("USDT", "")
+
+    icons = {
+        "hit_zone":   "📍",
+        "bounced":    "✅",
+        "broke_zone": "🚨",
+        "no_touch":   "⏰",
+    }
+    titles = {
+        "hit_zone":   "цена в зоне",
+        "bounced":    "отскок — зона держала",
+        "broke_zone": "зона пробита вниз",
+        "no_touch":   "зона не достигнута",
+    }
+
+    # Оценка: была ли рекомендация правильной
+    rec    = sig["rec_pct"]
+    assess = ""
+    if result == "bounced":
+        assess = "✅ Оценка верная" if rec >= 50 else "⚠️ Оценка занижена — стоило заходить"
+    elif result == "broke_zone":
+        assess = "✅ Оценка верная" if rec == 0 else f"⚠️ Оценка завышена — рекомендовали {rec}%"
+    elif result == "no_touch":
+        assess = "ℹ️ Зона не тестировалась"
+    elif result == "hit_zone":
+        assess = "👀 Цена в зоне — ждём результат"
+
+    msg = (
+        f"{icons.get(result, '📊')} <code>{symbol}</code> · {titles.get(result, result)}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"Сигнал: {sig['time']} · Зона: {sig['zone_low']:.6g}–{sig['zone_high']:.6g}\n"
+        f"Надёжность была: {sig['zq_score']}/10 · Рекомендация: {rec}%\n"
+        f"Результат: <b>{sig['result_detail']}</b>\n"
+        f"{assess}\n"
+        f"💎 <code>{coin}</code>"
+    )
+    send_message(msg)
+    print(f"  [RESULT] {symbol} → {result}")
+
+
+def build_daily_stats():
+    """Строит ежедневный отчёт по статистике сигналов."""
+    with tracker_lock:
+        all_sigs = list(signal_tracker.values())
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    yesterday = all_sigs  # берём все за последние 24ч
+
+    # Фильтруем за вчера
+    from_ts = time.time() - 86400
+    recent  = [s for s in all_sigs
+               if time.mktime(datetime.strptime(s["time"], "%Y-%m-%d %H:%M").timetuple()) >= from_ts]
+
+    if not recent:
+        return "📊 <b>Статистика за 24ч</b>\nСигналов не было"
+
+    total     = len(recent)
+    bounced   = sum(1 for s in recent if s["result"] == "bounced")
+    broke     = sum(1 for s in recent if s["result"] == "broke_zone")
+    hit       = sum(1 for s in recent if s["result"] == "hit_zone")
+    no_touch  = sum(1 for s in recent if s["result"] == "no_touch")
+    pending   = sum(1 for s in recent if s["result"] is None)
+
+    # По рекомендациям
+    dont_enter = [s for s in recent if s["rec_pct"] == 0]
+    de_correct = sum(1 for s in dont_enter if s["result"] in ("broke_zone", "no_touch"))
+
+    enter_sigs = [s for s in recent if s["rec_pct"] > 0]
+    en_correct = sum(1 for s in enter_sigs if s["result"] == "bounced")
+
+    acc_de = round(de_correct / len(dont_enter) * 100) if dont_enter else 0
+    acc_en = round(en_correct / len(enter_sigs) * 100) if enter_sigs else 0
+
+    # По зонам
+    by_score = {"опасно (0-3)": [], "слабая (4-5)": [], "умеренная (6-7)": [], "надёжная (8-10)": []}
+    for s in recent:
+        sc = s["zq_score"]
+        if sc <= 3:   by_score["опасно (0-3)"].append(s)
+        elif sc <= 5: by_score["слабая (4-5)"].append(s)
+        elif sc <= 7: by_score["умеренная (6-7)"].append(s)
+        else:         by_score["надёжная (8-10)"].append(s)
+
+    lines = [
+        f"📊 <b>Статистика сигналов за 24ч</b> · {today}",
+        "━━━━━━━━━━━━━━━━━━━",
+        f"Всего сигналов: <b>{total}</b>",
+        f"  ✅ Отскок (зона держала): <b>{bounced}</b>",
+        f"  🚨 Пробой зоны вниз:      <b>{broke}</b>",
+        f"  📍 Цена в зоне:           <b>{hit}</b>",
+        f"  ⏰ Не достигнута:         <b>{no_touch}</b>",
+        f"  🔄 Ещё в работе:          <b>{pending}</b>",
+        "",
+        f"🎯 Точность рекомендаций:",
+        f"  «Не заходить» ({len(dont_enter)} сигн.): <b>{acc_de}%</b> верно",
+        f"  «Заходить» ({len(enter_sigs)} сигн.):    <b>{acc_en}%</b> верно",
+        "",
+        "📈 По надёжности зоны:",
+    ]
+
+    for label, sigs in by_score.items():
+        if not sigs:
+            continue
+        b = sum(1 for s in sigs if s["result"] == "bounced")
+        bk = sum(1 for s in sigs if s["result"] == "broke_zone")
+        lines.append(f"  {label}: {len(sigs)} сигн · ✅{b} отскок · 🚨{bk} пробой")
+
+    # Топ-3 лучших сигнала
+    best = sorted([s for s in recent if s["result"] == "bounced"],
+                  key=lambda x: x["zq_score"], reverse=True)[:3]
+    if best:
+        lines.append("")
+        lines.append("🏆 Лучшие сигналы:")
+        for s in best:
+            lines.append(f"  {s['symbol']} · {s['zq_score']}/10 · {s['time']}")
+
+    return "\n".join(lines)
+
+
+def daily_stats_loop():
+    """Отправляет статистику каждый день в 09:00."""
+    print("  [STATS] Планировщик статистики запущен")
+    while True:
+        now  = datetime.now()
+        # Следующее 09:00
+        target = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target = target.replace(day=target.day + 1)
+        wait_sec = (target - now).total_seconds()
+        time.sleep(wait_sec)
+
+        # Проверяем результаты перед отчётом
+        check_signal_results()
+        msg = build_daily_stats()
+        send_message(msg)
+        print("  [STATS] 📊 Ежедневный отчёт отправлен")
+
+
+def signal_monitor_loop():
+    """Мониторит результаты сигналов каждые 2 минуты."""
+    print("  [STATS] Мониторинг сигналов запущен")
+    while True:
+        time.sleep(120)
+        try:
+            check_signal_results()
+        except Exception as e:
+            print(f"  [STATS ERR] {e}")
+
+
+# ─────────────────────────────────────────────
 #  ГЛАВНЫЙ ЗАПУСК
 # ─────────────────────────────────────────────
 
@@ -1876,6 +2141,11 @@ def main():
 
     # Инплей модуль в отдельном потоке
     threading.Thread(target=inplay_loop, args=(symbols_ref,), daemon=True).start()
+
+    # Мониторинг результатов сигналов
+    load_stats()
+    threading.Thread(target=signal_monitor_loop, daemon=True).start()
+    threading.Thread(target=daily_stats_loop, daemon=True).start()
 
     # Слой 1 — основной поток
     layer1_loop(symbols_ref)
