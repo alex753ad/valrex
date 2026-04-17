@@ -419,6 +419,80 @@ def calc_vwap(candles):
     return vwap
 
 
+def draw_volume_profile(ax, candles, n_bins=40, alpha=0.25, poc_color="#ffd700"):
+    """
+    Рисует горизонтальный Volume Profile (распределение объёма по цене) 
+    справа от графика, как на TradingView.
+    poc_color — цвет линии POC (Point of Control, максимальный объём).
+    """
+    if not candles:
+        return
+
+    highs  = [float(c[2]) for c in candles]
+    lows   = [float(c[3]) for c in candles]
+    vols   = [float(c[7]) for c in candles]  # quote volume (USD)
+
+    price_min = min(lows)
+    price_max = max(highs)
+    if price_max <= price_min:
+        return
+
+    # Разбиваем диапазон цен на n_bins бинов
+    bin_size  = (price_max - price_min) / n_bins
+    bin_vols  = [0.0] * n_bins
+
+    for i, c in enumerate(candles):
+        h   = float(c[2])
+        l   = float(c[3])
+        vol = vols[i]
+        # Распределяем объём свечи по всем бинам которые она перекрывает
+        for b in range(n_bins):
+            bin_lo = price_min + b * bin_size
+            bin_hi = bin_lo + bin_size
+            overlap = max(0, min(h, bin_hi) - max(l, bin_lo))
+            candle_range = h - l if h > l else bin_size
+            bin_vols[b] += vol * overlap / candle_range
+
+    max_vol = max(bin_vols) if max(bin_vols) > 0 else 1
+
+    # Находим POC — бин с максимальным объёмом
+    poc_bin   = bin_vols.index(max_vol)
+    poc_price = price_min + (poc_bin + 0.5) * bin_size
+
+    # Получаем текущие xlim чтобы нарисовать профиль справа
+    xlim = ax.get_xlim()
+    x_range   = xlim[1] - xlim[0]
+    bar_width  = x_range * 0.12  # профиль занимает 12% ширины графика
+    x_right    = xlim[1]          # правый край
+
+    for b in range(n_bins):
+        bin_lo    = price_min + b * bin_size
+        bin_price = bin_lo + bin_size / 2
+        vol_norm  = bin_vols[b] / max_vol
+        bar_len   = bar_width * vol_norm
+
+        # Цвет: бины выше POC — зеленоватые, ниже — красноватые
+        if b > poc_bin:
+            color = "#26a69a"
+        elif b < poc_bin:
+            color = "#ef5350"
+        else:
+            color = poc_color  # POC — золотой
+
+        ax.barh(bin_price, bar_len, height=bin_size * 0.85,
+                left=x_right - bar_len,
+                color=color, alpha=alpha, zorder=3)
+
+    # Линия POC
+    ax.axhline(y=poc_price, color=poc_color, lw=1.0, ls="-",
+               alpha=0.8, zorder=5)
+    ax.text(x_right, poc_price,
+            f" POC {poc_price:.6g}",
+            color=poc_color, fontsize=6, va="center",
+            fontweight="bold", zorder=7,
+            bbox=dict(facecolor="#0d1117", alpha=0.7, pad=1, edgecolor="none"))
+
+
 def build_chart(symbol, candles, levels=None):
     try:
         data   = candles[-60:]
@@ -480,6 +554,10 @@ def build_chart(symbol, candles, levels=None):
             for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
             ax.grid(color="#21262d", ls="--", lw=0.5)
             ax.set_xlim(-1, n)
+
+        # Volume Profile (после установки xlim)
+        draw_volume_profile(ax1, data)
+
         ax1.set_title(f"{symbol} · 1m", color="#e6edf3", fontsize=13, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
         ax2.set_ylabel("Vol USD",  color="#8b949e", fontsize=9)
@@ -1515,6 +1593,10 @@ def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
 
         ax1.legend(loc="upper left", fontsize=7, facecolor="#161b22",
                    edgecolor="#30363d", labelcolor="white", framealpha=0.8)
+
+        # Volume Profile
+        draw_volume_profile(ax1, data)
+
         ax1.set_title(f"{symbol} · ИНПЛЕЙ · 1m", color="#e6edf3",
                       fontsize=13, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
@@ -2782,6 +2864,8 @@ def build_deviation_chart(symbol, k1, mark, index):
             for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
             ax.grid(color="#21262d", ls="--", lw=0.5)
             ax.set_xlim(-1, n)
+        # Volume Profile
+        draw_volume_profile(ax1, data)
         ax1.set_title(f"{symbol} · Расхождение Mark/Index",
                       color="#e6edf3", fontsize=12, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
@@ -2920,6 +3004,8 @@ def build_inplay_digest_chart(symbol, k1):
             for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
             ax.grid(color="#21262d", ls="--", lw=0.5)
             ax.set_xlim(-1, n)
+        # Volume Profile
+        draw_volume_profile(ax1, data, n_bins=30, alpha=0.2)
         ax1.set_title(f"{symbol} · 1m", color="#e6edf3",
                       fontsize=10, fontweight="bold", pad=6)
         plt.tight_layout(pad=1.0)
