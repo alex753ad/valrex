@@ -405,6 +405,20 @@ TF_COLORS = {
     "res": {"1m": "#ff4444", "5m": "#ff8800", "15m": "#ff44ff"},
 }
 
+def calc_vwap(candles):
+    """Рассчитывает VWAP по свечам (типичная цена * объём / сумма объёмов)."""
+    vwap = []
+    cum_vol = 0.0
+    cum_pv  = 0.0
+    for c in candles:
+        typ_price = (float(c[2]) + float(c[3]) + float(c[4])) / 3
+        vol       = float(c[5])
+        cum_pv   += typ_price * vol
+        cum_vol  += vol
+        vwap.append(cum_pv / cum_vol if cum_vol > 0 else typ_price)
+    return vwap
+
+
 def build_chart(symbol, candles, levels=None):
     try:
         data   = candles[-60:]
@@ -429,6 +443,13 @@ def build_chart(symbol, candles, levels=None):
             ax1.add_patch(Rectangle((i-w/2, min(opens[i], closes[i])), w, bh,
                                      facecolor=color, edgecolor=color))
             ax2.bar(i, dvols[i], color=color, width=w, alpha=0.85)
+
+        # VWAP
+        vwap_vals = calc_vwap(data)
+        ax1.plot(range(n), vwap_vals, color="#ff9800", lw=1.2,
+                 ls="--", alpha=0.85, label="VWAP", zorder=6)
+        ax1.legend(loc="upper left", fontsize=7, facecolor="#161b22",
+                   edgecolor="#30363d", labelcolor="white", framealpha=0.7)
 
         if levels:
             pmn, pmx = min(lows), max(highs)
@@ -1434,6 +1455,11 @@ def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
                                      facecolor=color, edgecolor=color))
             ax2.bar(i, dvols[i], color=color, width=w, alpha=0.85)
 
+        # VWAP
+        vwap_vals = calc_vwap(data)
+        ax1.plot(range(n), vwap_vals, color="#ff9800", lw=1.2,
+                 ls="--", alpha=0.85, zorder=6)
+
         # Зона входа — закрашенная область
         ax1.axhspan(zone_low, zone_high, alpha=0.12, color="#ffd700", zorder=2)
         ax1.axhline(y=zone_high, color="#ffd700", lw=2.0, ls="-",  zorder=6,
@@ -1736,7 +1762,18 @@ def inplay_loop(symbols_ref):
                                     prev["zq_score"], prev["zq_verdict"], prev["rec_pct"], prev["zq_flags"],
                                     alert_type="zone_broken"
                                 )
-                                send_message(msg)
+                                k1_broken = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                                                  {"symbol": sym, "interval": "1m", "limit": 80})
+                                chart_broken = build_inplay_chart(
+                                    sym, k1_broken or [],
+                                    prev["zone_low"], prev["zone_high"],
+                                    prev.get("inner",[]), prev.get("rounds",[]),
+                                    prev.get("limits",[]), prev.get("broken",[])
+                                ) if k1_broken else None
+                                if chart_broken:
+                                    send_photo(chart_broken, msg)
+                                else:
+                                    send_message(msg)
                                 print(f"  [IP] 🚨 {sym} зона пробита")
                                 with inplay_lock:
                                     if sym in inplay_coins:
@@ -2673,6 +2710,297 @@ def signal_monitor_loop():
 
 
 # ─────────────────────────────────────────────
+#  РАСХОЖДЕНИЕ ЦЕНЫ (MARK vs INDEX) + ФАНДИНГ
+# ─────────────────────────────────────────────
+
+DEVIATION_THRESHOLD = 0.3   # % расхождения mark vs index для алерта
+DEVIATION_SCAN_SEC  = 30    # интервал проверки
+deviation_cache: dict = {}  # { symbol: last_alert_ts }
+
+
+def get_premium_index(symbol):
+    """Получает mark price, index price, funding rate."""
+    data = fetch(f"{BINANCE_BASE}/fapi/v1/premiumIndex", {"symbol": symbol})
+    if not data:
+        return None
+    return {
+        "mark":    float(data.get("markPrice", 0)),
+        "index":   float(data.get("indexPrice", 0)),
+        "funding": float(data.get("lastFundingRate", 0)),
+    }
+
+
+def build_deviation_chart(symbol, k1, mark, index):
+    """График с линиями mark price и index price."""
+    try:
+        data   = k1[-60:]
+        n      = len(data)
+        opens  = [float(c[1]) for c in data]
+        highs  = [float(c[2]) for c in data]
+        lows   = [float(c[3]) for c in data]
+        closes = [float(c[4]) for c in data]
+        dvols  = [float(c[7]) for c in data]
+        times  = [datetime.utcfromtimestamp(int(c[0])/1000) for c in data]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 8),
+                                        gridspec_kw={"height_ratios": [3, 1]},
+                                        facecolor="#0d1117")
+        ax1.set_facecolor("#0d1117")
+        ax2.set_facecolor("#0d1117")
+        w = 0.6
+        for i in range(n):
+            color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
+            ax1.plot([i, i], [lows[i], highs[i]], color=color, lw=0.8)
+            bh = abs(closes[i]-opens[i]) or (highs[i]-lows[i])*0.01
+            ax1.add_patch(Rectangle((i-w/2, min(opens[i], closes[i])), w, bh,
+                                     facecolor=color, edgecolor=color))
+            ax2.bar(i, dvols[i], color=color, width=w, alpha=0.85)
+
+        # VWAP
+        vwap_vals = calc_vwap(data)
+        ax1.plot(range(n), vwap_vals, color="#ff9800", lw=1.2,
+                 ls="--", alpha=0.85, label="VWAP", zorder=6)
+
+        # Mark price
+        ax1.axhline(y=mark,  color="#ff4444", lw=1.5, ls="-",
+                    label=f"Mark {mark:.6g}", zorder=7)
+        # Index price
+        ax1.axhline(y=index, color="#4488ff", lw=1.5, ls="--",
+                    label=f"Index {index:.6g}", zorder=7)
+
+        ax1.legend(loc="upper left", fontsize=7, facecolor="#161b22",
+                   edgecolor="#30363d", labelcolor="white", framealpha=0.8)
+
+        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: fmt_usd(x)))
+        ticks = list(range(0, n, max(1, n//6)))
+        for ax in [ax1, ax2]:
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([times[i].strftime("%H:%M") for i in ticks],
+                                color="#8b949e", fontsize=8)
+            ax.tick_params(colors="#8b949e", labelsize=8)
+            ax.yaxis.set_tick_params(labelcolor="#8b949e")
+            for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
+            ax.grid(color="#21262d", ls="--", lw=0.5)
+            ax.set_xlim(-1, n)
+        ax1.set_title(f"{symbol} · Расхождение Mark/Index",
+                      color="#e6edf3", fontsize=12, fontweight="bold", pad=8)
+        ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
+        ax2.set_ylabel("Vol USD", color="#8b949e", fontsize=9)
+        plt.tight_layout(pad=1.2)
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
+        plt.close(fig); buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"  [DEV CHART ERR {symbol}] {e}")
+        return None
+
+
+def deviation_scan_loop(symbols_ref):
+    """Сканирует расхождение mark/index price каждые 30 сек."""
+    print("  [DEV] Детектор расхождений запущен")
+    while True:
+        time.sleep(DEVIATION_SCAN_SEC)
+        symbols = symbols_ref[0]
+        if not symbols:
+            continue
+
+        def check_deviation(sym):
+            try:
+                pi = get_premium_index(sym)
+                if not pi or pi["index"] == 0:
+                    return
+                mark   = pi["mark"]
+                index  = pi["index"]
+                fund   = pi["funding"]
+                dev_pct = (mark - index) / index * 100
+
+                if abs(dev_pct) < DEVIATION_THRESHOLD:
+                    return
+
+                # Дедупликация — не чаще раза в 15 мин на символ
+                now = time.time()
+                if now - deviation_cache.get(sym, 0) < 900:
+                    return
+                deviation_cache[sym] = now
+
+                direction = "Выше" if dev_pct > 0 else "Ниже"
+                coin = sym.replace("USDT", "")
+
+                # Фандинг-интерпретация
+                if fund > 0.001:
+                    fund_str = f"🔴 {fund*100:.4f}% (лонги платят шортам — перегрев лонгов)"
+                elif fund < -0.001:
+                    fund_str = f"🟢 {fund*100:.4f}% (шорты платят лонгам — перегрев шортов)"
+                else:
+                    fund_str = f"⚪ {fund*100:.4f}% (нейтральный)"
+
+                caption = (
+                    f"📊 <code>{sym}</code> · расхождение цены\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"Тикер: <b>{sym}</b>\n"
+                    f"Отклонение: <b>{abs(dev_pct):.2f}%</b> ({direction} индекса)\n"
+                    f"Цена Index: <b>{index:.6g}</b>\n"
+                    f"Цена Mark: <b>{mark:.6g}</b>\n"
+                    f"Фандинг: {fund_str}\n"
+                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"{'⚠️ Цена выше индекса — риск коррекции к индексу' if dev_pct > 0 else '⚠️ Цена ниже индекса — возможен отскок к индексу'}\n"
+                    f"💎 <code>{coin}</code>"
+                )
+
+                k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                           {"symbol": sym, "interval": "1m", "limit": 60})
+                chart = build_deviation_chart(sym, k1, mark, index) if k1 else None
+                if chart:
+                    send_photo(chart, caption)
+                else:
+                    send_message(caption)
+                print(f"  [DEV] 📊 {sym} dev={dev_pct:+.2f}% fund={fund*100:.4f}%")
+
+            except Exception as e:
+                print(f"  [DEV ERR {sym}] {e}")
+
+        # Проверяем только активные + инплей монеты (не все 300+)
+        watched = set()
+        with active_lock:
+            watched.update(active_coins.keys())
+        with inplay_lock:
+            watched.update(inplay_coins.keys())
+
+        if watched:
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                list(pool.map(check_deviation, list(watched)))
+
+
+# ─────────────────────────────────────────────
+#  ЧАСОВОЙ ДАЙДЖЕСТ ИНПЛЕЙ МОНЕТ
+# ─────────────────────────────────────────────
+
+def build_inplay_digest_chart(symbol, k1):
+    """Простой 1m график для дайджеста."""
+    try:
+        data   = k1[-60:]
+        n      = len(data)
+        opens  = [float(c[1]) for c in data]
+        highs  = [float(c[2]) for c in data]
+        lows   = [float(c[3]) for c in data]
+        closes = [float(c[4]) for c in data]
+        dvols  = [float(c[7]) for c in data]
+        times  = [datetime.utcfromtimestamp(int(c[0])/1000) for c in data]
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6),
+                                        gridspec_kw={"height_ratios": [3, 1]},
+                                        facecolor="#0d1117")
+        ax1.set_facecolor("#0d1117")
+        ax2.set_facecolor("#0d1117")
+        w = 0.6
+        for i in range(n):
+            color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
+            ax1.plot([i, i], [lows[i], highs[i]], color=color, lw=0.8)
+            bh = abs(closes[i]-opens[i]) or (highs[i]-lows[i])*0.01
+            ax1.add_patch(Rectangle((i-w/2, min(opens[i], closes[i])), w, bh,
+                                     facecolor=color, edgecolor=color))
+            ax2.bar(i, dvols[i], color=color, width=w, alpha=0.85)
+
+        # VWAP
+        vwap_vals = calc_vwap(data)
+        ax1.plot(range(n), vwap_vals, color="#ff9800", lw=1.0,
+                 ls="--", alpha=0.85, label="VWAP", zorder=6)
+        ax1.legend(loc="upper left", fontsize=6, facecolor="#161b22",
+                   edgecolor="#30363d", labelcolor="white", framealpha=0.7)
+
+        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: fmt_usd(x)))
+        ticks = list(range(0, n, max(1, n//5)))
+        for ax in [ax1, ax2]:
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([times[i].strftime("%H:%M") for i in ticks],
+                                color="#8b949e", fontsize=7)
+            ax.tick_params(colors="#8b949e", labelsize=7)
+            ax.yaxis.set_tick_params(labelcolor="#8b949e")
+            for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
+            ax.grid(color="#21262d", ls="--", lw=0.5)
+            ax.set_xlim(-1, n)
+        ax1.set_title(f"{symbol} · 1m", color="#e6edf3",
+                      fontsize=10, fontweight="bold", pad=6)
+        plt.tight_layout(pad=1.0)
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=100, facecolor="#0d1117")
+        plt.close(fig); buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"  [DIGEST CHART ERR {symbol}] {e}")
+        return None
+
+
+def hourly_inplay_digest():
+    """Каждый час отправляет дайджест всех инплей монет."""
+    print("  [DIGEST] Часовой дайджест запущен")
+    while True:
+        # Ждём до следующего часа :00
+        now    = datetime.now()
+        from datetime import timedelta
+        next_h = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        wait   = (next_h - now).total_seconds()
+        time.sleep(wait)
+
+        with inplay_lock:
+            snapshot = dict(inplay_coins)
+
+        if not snapshot:
+            send_message("📋 <b>Инплей дайджест</b>\nНет активных монет")
+            continue
+
+        # Заголовок дайджеста
+        header = (f"📋 <b>Инплей дайджест</b> · {datetime.now().strftime('%H:%M')}\n"
+                  f"Монет в наблюдении: <b>{len(snapshot)}</b>\n"
+                  f"━━━━━━━━━━━━━━━━━━━")
+        send_message(header)
+
+        # По каждой монете — график + краткая сводка
+        for sym, state in list(snapshot.items()):
+            try:
+                k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                           {"symbol": sym, "interval": "1m", "limit": 60})
+                if not k1:
+                    continue
+
+                close  = float(k1[-1][4])
+                # Изменение за день
+                k1d = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                            {"symbol": sym, "interval": "1d", "limit": 2})
+                day_open  = float(k1d[0][1]) if k1d and len(k1d) >= 1 else close
+                day_chg   = (close - day_open) / day_open * 100 if day_open > 0 else 0
+
+                # Объём за последний час
+                k1h = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                            {"symbol": sym, "interval": "1h", "limit": 2})
+                vol_1h = float(k1h[-2][7]) if k1h and len(k1h) >= 2 else 0
+
+                zone_high = state.get("zone_high", 0)
+                zone_low  = state.get("zone_low", 0)
+                dist = (close - zone_high) / zone_high * 100 if zone_high else 0
+                zq   = state.get("zq_score", "?")
+
+                caption = (
+                    f"<code>{sym}</code> · {day_chg:+.1f}% за день\n"
+                    f"Цена: <b>{close:.6g}</b> · Объём 1ч: <b>{fmt_usd(vol_1h)}</b>\n"
+                    f"Зона: {zone_low:.6g}–{zone_high:.6g} · До зоны: {dist:+.1f}%\n"
+                    f"Надёжность: {zq}/10"
+                )
+                chart = build_inplay_digest_chart(sym, k1)
+                if chart:
+                    send_photo(chart, caption)
+                else:
+                    send_message(caption)
+                time.sleep(1)  # не флудим
+
+            except Exception as e:
+                print(f"  [DIGEST ERR {sym}] {e}")
+
+        print(f"  [DIGEST] Отправлен дайджест: {len(snapshot)} монет")
+
+
+# ─────────────────────────────────────────────
 #  ГЛАВНЫЙ ЗАПУСК
 # ─────────────────────────────────────────────
 
@@ -2707,6 +3035,12 @@ def main():
 
     # Детектор псевдопампов в отдельном потоке
     threading.Thread(target=pseudo_loop, args=(symbols_ref,), daemon=True).start()
+
+    # Детектор расхождений mark/index
+    threading.Thread(target=deviation_scan_loop, args=(symbols_ref,), daemon=True).start()
+
+    # Часовой дайджест инплей
+    threading.Thread(target=hourly_inplay_digest, daemon=True).start()
 
     # Мониторинг результатов сигналов
     load_stats()
