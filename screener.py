@@ -1758,7 +1758,8 @@ def inplay_loop(symbols_ref):
                         # Регистрируем сигнал для контроля
                         register_signal(sym, zone_low, zone_high,
                                         data["zq_score"], data["zq_verdict"],
-                                        data["rec_pct"], close)
+                                        data["rec_pct"], close,
+                                        k1=data["k1"], peak_mins=data["peak_mins"])
                         print(f"  [IP] 🚀 {sym} инплей +{data['pump_pct']}%")
 
                     with inplay_lock:
@@ -1873,23 +1874,38 @@ def save_stats():
 
 
 def register_signal(symbol, zone_low, zone_high, zq_score, zq_verdict,
-                    rec_pct, close_now):
+                    rec_pct, close_now, k1=None, peak_mins=0):
     """Регистрирует новый сигнал для последующего контроля."""
     sid = f"{symbol}_{int(time.time())}"
+
+    # Объём проторговки — среднее за последние 10 свечей (органичность)
+    vol_during_pump = 0
+    vol_at_peak     = 0
+    if k1 and len(k1) >= 15:
+        vols = [float(c[7]) for c in k1]
+        vol_during_pump = sum(vols[-20:-5]) / 15 if len(vols) >= 20 else sum(vols[:-5]) / max(1, len(vols)-5)
+        vol_at_peak     = sum(vols[-5:]) / 5
+
     entry = {
-        "id":             sid,
-        "symbol":         symbol,
-        "time":           datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "zone_low":       zone_low,
-        "zone_high":      zone_high,
-        "zq_score":       zq_score,
-        "zq_verdict":     zq_verdict,
-        "rec_pct":        rec_pct,
-        "close_at_signal": close_now,
-        "result":         None,
-        "result_time":    None,
-        "result_close":   None,
-        "result_detail":  None,
+        "id":               sid,
+        "symbol":           symbol,
+        "time":             datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "zone_low":         zone_low,
+        "zone_high":        zone_high,
+        "zq_score":         zq_score,
+        "zq_verdict":       zq_verdict,
+        "rec_pct":          rec_pct,
+        "close_at_signal":  close_now,
+        "peak_mins":        peak_mins,
+        "vol_during_pump":  round(vol_during_pump, 0),
+        "vol_at_peak":      round(vol_at_peak, 0),
+        "zone_touch_time":  None,   # когда цена коснулась зоны
+        "result":           None,
+        "result_time":      None,
+        "result_close":     None,
+        "result_detail":    None,
+        "travel_mins":      None,   # сколько минут шла от пика до зоны
+        "mini_bounces":     [],     # мини отскоки по пути
     }
     with tracker_lock:
         signal_tracker[sid] = entry
@@ -1897,10 +1913,49 @@ def register_signal(symbol, zone_low, zone_high, zq_score, zq_verdict,
     return sid
 
 
+def _detect_mini_bounces(k1_range, zone_high, natr):
+    """
+    Находит мини-отскоки в коррекции от пика до зоны.
+    Ищет свечи где цена отскочила от круглого числа или уровня на ≥ 0.3×NATR.
+    """
+    bounces = []
+    if not k1_range or len(k1_range) < 3:
+        return bounces
+
+    closes = [float(c[4]) for c in k1_range]
+    lows   = [float(c[3]) for c in k1_range]
+
+    for i in range(1, len(k1_range) - 1):
+        lo  = lows[i]
+        # Локальный минимум
+        if lo > lows[i-1] or lo > lows[i+1]:
+            continue
+        # Отскок от этого лоя
+        rebound = (closes[i+1] - lo) / lo * 100 if lo > 0 else 0
+        if rebound < natr * 0.3:
+            continue
+
+        # Определяем причину отскока
+        reason = "уровень"
+        # Круглое число?
+        rounds = find_round_numbers_in_zone(lo * 0.999, lo * 1.001)
+        if rounds:
+            reason = f"круглое {rounds[0]:.6g}"
+
+        bounces.append({
+            "price":   round(lo, 8),
+            "rebound": round(rebound, 2),
+            "reason":  reason,
+            "time":    datetime.utcfromtimestamp(int(k1_range[i][0])/1000).strftime("%H:%M"),
+        })
+
+    return bounces
+
+
 def check_signal_results():
     """
-    Проверяет результаты незакрытых сигналов.
-    Запускается каждые 2 минуты.
+    Проверяет результаты незакрытых сигналов каждые 2 минуты.
+    Отслеживает: время движения от пика до зоны, мини-отскоки, дивергенцию объёма.
     """
     now = time.time()
     with tracker_lock:
@@ -1913,39 +1968,52 @@ def check_signal_results():
         zone_high = sig["zone_high"]
         signal_ts = time.mktime(datetime.strptime(sig["time"], "%Y-%m-%d %H:%M").timetuple())
 
-        # Сигнал старше 4 часов — закрываем как "no_touch"
         if now - signal_ts > 14400:
             with tracker_lock:
-                signal_tracker[sid]["result"]       = "no_touch"
-                signal_tracker[sid]["result_time"]  = datetime.now().strftime("%H:%M")
+                signal_tracker[sid]["result"]        = "no_touch"
+                signal_tracker[sid]["result_time"]   = datetime.now().strftime("%H:%M")
                 signal_tracker[sid]["result_detail"] = "Зона не была достигнута за 4ч"
             save_stats()
             _send_result_alert(signal_tracker[sid])
             continue
 
         k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                   {"symbol": symbol, "interval": "1m", "limit": 10})
+                   {"symbol": symbol, "interval": "1m", "limit": 60})
         if not k1:
             continue
 
         close = float(k1[-1][4])
         pct   = (close - sig["close_at_signal"]) / sig["close_at_signal"] * 100
+        natr  = calc_natr(k1)
+
+        # Время движения от пика до зоны
+        highs = [float(c[2]) for c in k1]
+        peak_idx = len(highs) - 1 - highs[::-1].index(max(highs))
+        travel_mins = len(k1) - 1 - peak_idx
+
+        # Мини-отскоки в коррекции
+        correction_candles = k1[peak_idx:] if peak_idx < len(k1) else []
+        mini_bounces = _detect_mini_bounces(correction_candles, zone_high, natr)
 
         result = None
         detail = None
 
         if zone_low <= close <= zone_high:
-            # Цена в зоне
             result = "hit_zone"
-            detail = f"Цена вошла в зону · текущая: {close:.6g} ({pct:+.1f}%)"
+            detail = f"Цена вошла в зону · {close:.6g} ({pct:+.1f}%)"
         elif close < zone_low * 0.998:
-            # Пробой зоны вниз
             result = "broke_zone"
-            detail = f"Зона пробита вниз · {close:.6g} ({pct:+.1f}%) · убирай лимитки"
+            detail = f"Зона пробита вниз · {close:.6g} ({pct:+.1f}%)"
         elif close > zone_high * 1.02 and pct > 3:
-            # Отскок от зоны вверх (зона сработала)
             result = "bounced"
             detail = f"Отскок от зоны вверх · {close:.6g} ({pct:+.1f}%) · зона держала"
+
+        # Обновляем travel_mins и mini_bounces всегда
+        with tracker_lock:
+            signal_tracker[sid]["travel_mins"]  = travel_mins
+            signal_tracker[sid]["mini_bounces"] = mini_bounces
+            if sig.get("zone_touch_time") is None and zone_low <= close <= zone_high:
+                signal_tracker[sid]["zone_touch_time"] = datetime.now().strftime("%H:%M")
 
         if result:
             with tracker_lock:
@@ -1953,15 +2021,18 @@ def check_signal_results():
                 signal_tracker[sid]["result_time"]  = datetime.now().strftime("%H:%M")
                 signal_tracker[sid]["result_close"] = close
                 signal_tracker[sid]["result_detail"] = detail
+                signal_tracker[sid]["k1_snapshot"]  = k1  # для графика
             save_stats()
-            _send_result_alert(signal_tracker[sid])
+            _send_result_alert(signal_tracker[sid], k1)
 
 
-def _send_result_alert(sig):
-    """Отправляет результат отработки сигнала."""
+def _send_result_alert(sig, k1=None):
+    """Отправляет результат отработки сигнала с графиком и расширенным анализом."""
     result = sig["result"]
     symbol = sig["symbol"]
     coin   = symbol.replace("USDT", "")
+    zone_low  = sig["zone_low"]
+    zone_high = sig["zone_high"]
 
     icons = {
         "hit_zone":   "📍",
@@ -1976,7 +2047,6 @@ def _send_result_alert(sig):
         "no_touch":   "зона не достигнута",
     }
 
-    # Оценка: была ли рекомендация правильной
     rec    = sig["rec_pct"]
     assess = ""
     if result == "bounced":
@@ -1988,16 +2058,86 @@ def _send_result_alert(sig):
     elif result == "hit_zone":
         assess = "👀 Цена в зоне — ждём результат"
 
-    msg = (
-        f"{icons.get(result, '📊')} <code>{symbol}</code> · {titles.get(result, result)}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"Сигнал: {sig['time']} · Зона: {sig['zone_low']:.6g}–{sig['zone_high']:.6g}\n"
-        f"Надёжность была: {sig['zq_score']}/10 · Рекомендация: {rec}%\n"
-        f"Результат: <b>{sig['result_detail']}</b>\n"
-        f"{assess}\n"
-        f"💎 <code>{coin}</code>"
-    )
-    send_message(msg)
+    # Дивергенция объёма проторговки
+    vp = sig.get("vol_during_pump", 0)
+    va = sig.get("vol_at_peak", 0)
+    if vp > 0 and va > 0:
+        vol_ratio = va / vp
+        if vol_ratio < 0.4:
+            vol_div = f"⚠️ Объём на пике упал до {vol_ratio*100:.0f}% от пампа (дивергенция)"
+        elif vol_ratio < 0.7:
+            vol_div = f"🟡 Объём на пике умеренный ({vol_ratio*100:.0f}% от пампа)"
+        else:
+            vol_div = f"✅ Объём на пике держится ({vol_ratio*100:.0f}% от пампа)"
+    else:
+        vol_div = ""
+
+    # Время движения от пика до зоны
+    travel = sig.get("travel_mins")
+    if travel is not None:
+        if travel >= 15:
+            travel_str = f"✅ Время коррекции: {travel}мин (медленно — зона надёжнее)"
+        elif travel >= 5:
+            travel_str = f"🟡 Время коррекции: {travel}мин (умеренно)"
+        else:
+            travel_str = f"⚠️ Время коррекции: {travel}мин (быстро — риск пробоя)"
+    else:
+        travel_str = ""
+
+    # Проторговка на пике
+    peak_mins = sig.get("peak_mins", 0)
+    peak_str  = f"Проторговка на пике: {peak_mins}мин" if peak_mins else "Проторговки на пике не было"
+
+    # Мини отскоки
+    bounces = sig.get("mini_bounces", [])
+    if bounces:
+        b_lines = [f"  · {b['time']} {b['price']:.6g} +{b['rebound']:.1f}% ({b['reason']})"
+                   for b in bounces[:4]]
+        bounces_str = "🪜 Мини-отскоки в коррекции:\n" + "\n".join(b_lines)
+    else:
+        bounces_str = "Мини-отскоков не обнаружено"
+
+    lines = [
+        f"{icons.get(result,'📊')} <code>{symbol}</code> · {titles.get(result, result)}",
+        "━━━━━━━━━━━━━━━━━━━",
+        f"Сигнал: {sig['time']} · Зона: {zone_low:.6g}–{zone_high:.6g}",
+        f"Надёжность: {sig['zq_score']}/10 · Рекомендация: {rec}%",
+        f"Результат: <b>{sig['result_detail']}</b>",
+        assess,
+        "",
+        travel_str,
+        peak_str,
+        vol_div,
+        bounces_str,
+        f"\n💎 <code>{coin}</code>",
+    ]
+    caption = "\n".join(l for l in lines if l)
+
+    # График результата
+    chart = None
+    if k1 and len(k1) >= 20:
+        try:
+            # Строим с зоной
+            levels_for_chart = [
+                {"price": zone_high, "touches": 2, "type": "res", "tf": "zone"},
+                {"price": zone_low,  "touches": 2, "type": "sup", "tf": "zone"},
+            ]
+            # Добавляем мини-отскоки как уровни
+            for b in bounces[:3]:
+                levels_for_chart.append({
+                    "price": b["price"], "touches": 1, "type": "sup", "tf": "1m"
+                })
+            chart = build_inplay_chart(
+                symbol, k1, zone_low, zone_high,
+                [], [], [], levels_for_chart
+            )
+        except Exception as e:
+            print(f"  [RESULT CHART ERR] {e}")
+
+    if chart:
+        send_photo(chart, caption)
+    else:
+        send_message(caption)
     print(f"  [RESULT] {symbol} → {result}")
 
 
@@ -2083,12 +2223,21 @@ def daily_stats_loop():
     """Отправляет статистику каждый день в 09:00."""
     print("  [STATS] Планировщик статистики запущен")
     while True:
-        now  = datetime.now()
-        # Следующее 09:00
+        now    = datetime.now()
         target = now.replace(hour=9, minute=0, second=0, microsecond=0)
         if now >= target:
-            target = target.replace(day=target.day + 1)
-        wait_sec = (target - now).total_seconds()
+            # Следующее 09:00 завтра
+            target = target.replace(year=target.year,
+                                    month=target.month,
+                                    day=target.day) 
+            target = datetime(target.year, target.month, target.day, 9, 0, 0)
+            target = target.replace(day=target.day + 1) if target <= now else target
+            # Безопасный расчёт следующего дня
+            from datetime import timedelta
+            target = (now + timedelta(days=1)).replace(hour=9, minute=0,
+                                                        second=0, microsecond=0)
+        wait_sec = max(0, (target - now).total_seconds())
+        print(f"  [STATS] Следующий отчёт через {wait_sec/3600:.1f}ч")
         time.sleep(wait_sec)
 
         # Проверяем результаты перед отчётом
