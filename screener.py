@@ -20,6 +20,14 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from matplotlib.patches import Rectangle
 
+# Хранилище скринов псевдопампов (PostgreSQL)
+try:
+    from db_pump_storage import get_db as _get_pump_db
+    _PUMP_DB_AVAILABLE = True
+except ImportError:
+    _PUMP_DB_AVAILABLE = False
+    print("  [DB] db_pump_storage.py не найден — хранилище отключено")
+
 # ─────────────────────────────────────────────
 #  НАСТРОЙКИ
 # ─────────────────────────────────────────────
@@ -2327,6 +2335,16 @@ def pseudo_loop(symbols_ref):
                         print(f"  [PSEUDO] ⚠️ {sym} псевдопамп {d['score']}/4 крит"
                               f" +{d['pump_pct']}% за {d['pump_mins']}мин")
 
+                        # Сохраняем первый скрин в PostgreSQL
+                        if _PUMP_DB_AVAILABLE:
+                            try:
+                                db = _get_pump_db()
+                                eid = db.save_start(sym, d, chart)
+                                # Запоминаем event_id в кэше монеты
+                                d["_db_event_id"] = eid
+                            except Exception as _dbe:
+                                print(f"  [DB ERR] {_dbe}")
+
                     with pseudo_lock:
                         pseudo_coins[sym] = {**d, "since": time.time()}
 
@@ -2354,6 +2372,16 @@ def pseudo_loop(symbols_ref):
                             send_message(msg)
                         print(f"  [PSEUDO] 🎯 {sym} ретест хая псевдопампа")
 
+                        # Сохраняем финальный скрин в PostgreSQL
+                        if _PUMP_DB_AVAILABLE:
+                            try:
+                                eid = d.get("_db_event_id") or (prev or {}).get("_db_event_id")
+                                if eid:
+                                    _get_pump_db().save_end(eid, close_now, chart_rt,
+                                                            outcome="retest_short")
+                            except Exception as _dbe:
+                                print(f"  [DB ERR end] {_dbe}")
+
                 # ── Алерт: цена вернулась к pre-pump зоне ──
                 if d["pre_pump_low"] * 0.995 <= close_now <= d["pre_pump_high"] * 1.005:
                     key = f"pseudo_prepump_{sym}"
@@ -2376,6 +2404,16 @@ def pseudo_loop(symbols_ref):
                         else:
                             send_message(msg)
                         print(f"  [PSEUDO] 📈 {sym} pre-pump уровень достигнут")
+
+                        # Сохраняем финальный скрин в PostgreSQL
+                        if _PUMP_DB_AVAILABLE:
+                            try:
+                                eid = d.get("_db_event_id") or (prev or {}).get("_db_event_id")
+                                if eid:
+                                    _get_pump_db().save_end(eid, close_now, chart_pp,
+                                                            outcome="prepump_long")
+                            except Exception as _dbe:
+                                print(f"  [DB ERR end] {_dbe}")
 
             except Exception as e:
                 print(f"  [PSEUDO ERR {sym}] {e}")
@@ -3405,6 +3443,13 @@ def hourly_inplay_digest():
 
 def main():
     print("🚀 Crypto Screener v4 — 3-слойная архитектура\n")
+
+    # PostgreSQL хранилище псевдопампов
+    if _PUMP_DB_AVAILABLE:
+        try:
+            _get_pump_db()   # инициализирует соединение и схему
+        except Exception as e:
+            print(f"  [DB] Инициализация не удалась: {e}")
 
     # Прокси
     refresh_proxies()
