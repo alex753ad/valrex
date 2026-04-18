@@ -1574,14 +1574,37 @@ def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
         ax1.axhline(y=zone_low,  color="#ffd700", lw=2.0, ls="--", zorder=6,
                     label=f"Зона низ {zone_low:.6g}")
 
-        # Пробитые уровни (стек)
+        # Пробитые уровни (стек) — текущей зоны
         for lv in broken_levels:
             if lv["price"] != zone_high and lv["price"] != zone_low:
                 ax1.axhline(y=lv["price"], color="#aaaaaa", lw=0.8, ls=":",
                             alpha=0.6, zorder=4)
                 ax1.text(n-0.5, lv["price"],
-                         f" {lv['price']:.6g} [{lv['tf']}] {lv['hold_mins']}мин",
+                         f" {lv['price']:.6g} [{lv['tf']}] {lv.get('hold_mins','?')}мин",
                          color="#aaaaaa", fontsize=6, va="center")
+
+        # Все доп. зоны ниже текущей (поддержки для zone_broken)
+        pmn, pmx = min(lows), max(highs)
+        margin   = (pmx - pmn) * 0.25
+        below_all = sorted(
+            [lv for lv in broken_levels
+             if lv["price"] < zone_low * 0.999
+             and lv["price"] >= pmn - margin],
+            key=lambda x: x["price"], reverse=True
+        )
+        zone_colors_below = ["#26a69a", "#00bcd4", "#4fc3f7"]
+        for idx2, lv2 in enumerate(below_all[:3]):
+            c2 = zone_colors_below[min(idx2, 2)]
+            # Спан 0.3% вокруг уровня как мини-зона
+            spread = lv2["price"] * 0.003
+            ax1.axhspan(lv2["price"] - spread, lv2["price"] + spread,
+                        alpha=0.10, color=c2, zorder=2)
+            ax1.axhline(y=lv2["price"], color=c2, lw=1.2, ls="--",
+                        alpha=0.85, zorder=5)
+            ax1.text(n - 0.5, lv2["price"],
+                     f" {lv2['price']:.6g} [{lv2['tf']}] ×{lv2.get('touches','?')} {lv2.get('hold_mins','?')}мин",
+                     color=c2, fontsize=6, va="center",
+                     bbox=dict(facecolor="#0d1117", alpha=0.5, pad=1, edgecolor="none"))
 
         # Внутренние уровни в зоне
         for lv in inner_levels:
@@ -1722,7 +1745,28 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
     if alert_type == "zone_broken":
         lines.append("")
         lines.append("⚠️ Нижняя граница пробита вниз на объёме")
-        lines.append("Убирай лимитки · следующая поддержка ниже")
+        # Ищем следующую поддержку ниже зоны (из переданных уровней)
+        below_levels = sorted(
+            [lv for lv in (broken_levels or []) if lv["price"] < zone_low * 0.999],
+            key=lambda x: x["price"], reverse=True
+        )
+        if below_levels:
+            ns = below_levels[0]
+            dist_ns = round((ns["price"] - close) / close * 100, 2)
+            lines.append(
+                f"Убирай лимитки · следующая поддержка: "
+                f"<b>{ns['price']:.6g}</b> [{ns['tf']}] ({dist_ns:+.1f}%) "
+                f"× {ns.get('touches', '?')} касаний · держится {ns.get('hold_mins', '?')}мин"
+            )
+            # Если есть ещё уровни — добавляем вторую поддержку
+            if len(below_levels) >= 2:
+                ns2 = below_levels[1]
+                dist_ns2 = round((ns2["price"] - close) / close * 100, 2)
+                lines.append(
+                    f"  Далее: <b>{ns2['price']:.6g}</b> [{ns2['tf']}] ({dist_ns2:+.1f}%)"
+                )
+        else:
+            lines.append("Убирай лимитки · следующая поддержка ниже")
 
     lines.append(f"\n💎 <code>{coin}</code>")
     return "\n".join(lines)
@@ -2257,7 +2301,39 @@ def build_pseudo_chart(symbol, k1, d):
         return None
 
 
-def can_pseudo_alert(symbol, cooldown=300):
+def detect_pseudo_dump_start(k1, peak_idx):
+    """
+    Определяет начало слива псевдопампа:
+    - объём последних 3 свечей падает относительно пика
+    - хаи снижаются (lower highs) минимум 2 свечи подряд после пика
+    - с момента пика прошло не более 10 свечей (свежий памп)
+    Возвращает True если началась фаза слива.
+    """
+    n = len(k1)
+    mins_since_peak = n - 1 - peak_idx
+    if mins_since_peak < 2 or mins_since_peak > 10:
+        return False
+
+    post = k1[peak_idx:]
+    highs_post = [float(c[2]) for c in post]
+    vols_post  = [float(c[7]) for c in post]
+
+    # Объём снижается от пика
+    if len(vols_post) < 3:
+        return False
+    vol_peak = vols_post[0]
+    vol_now  = vols_post[-1]
+    vol_declining = vol_now < vol_peak * 0.4  # объём упал до < 40% от пика
+
+    # Lower highs — хаи снижаются 2+ свечи подряд
+    lower_highs = 0
+    for i in range(1, len(highs_post)):
+        if highs_post[i] < highs_post[i-1]:
+            lower_highs += 1
+        else:
+            lower_highs = 0  # сбрасываем серию
+
+    return vol_declining and lower_highs >= 2
     now = time.time()
     key = f"pseudo_{symbol}"
     if now - pseudo_alert_cache.get(key, 0) >= cooldown:
@@ -2312,7 +2388,6 @@ def pseudo_loop(symbols_ref):
             try:
                 result = pseudo_scan_symbol(sym)
                 if result is None:
-                    # Не псевдопамп — убираем из кэша если был
                     with pseudo_lock:
                         pseudo_coins.pop(sym, None)
                     return
@@ -2321,97 +2396,139 @@ def pseudo_loop(symbols_ref):
                 with pseudo_lock:
                     prev = pseudo_coins.get(sym)
 
-                # Новый псевдопамп или хай изменился значительно
-                if prev is None or abs(d["peak_high"] - prev.get("peak_high", 0)) / d["peak_high"] * 100 > 1.0:
-                    if can_pseudo_alert(sym):
+                close_now = d["close_now"]
+
+                # ── РАННИЙ АЛЕРТ: памп только что случился, началась фаза слива ──
+                # Детектируем СРАЗУ после пика — объём падает, хаи снижаются
+                k1_early = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                                 {"symbol": sym, "interval": "1m", "limit": 120})
+                peak_idx_early = None
+                if k1_early:
+                    highs_all = [float(c[2]) for c in k1_early]
+                    peak_idx_early = highs_all.index(max(highs_all[-30:]))
+
+                early_dump = (
+                    k1_early is not None
+                    and peak_idx_early is not None
+                    and detect_pseudo_dump_start(k1_early, peak_idx_early)
+                )
+
+                # Новый псевдопамп или хай значительно изменился
+                is_new = (prev is None or
+                          abs(d["peak_high"] - prev.get("peak_high", 0))
+                          / d["peak_high"] * 100 > 1.0)
+
+                if is_new and early_dump:
+                    # Ранний алерт — цена ещё около хая, начались первые продажи
+                    alert_key = f"pseudo_{sym}"
+                    now_t = time.time()
+                    if now_t - pseudo_alert_cache.get(alert_key, 0) >= 300:
+                        pseudo_alert_cache[alert_key] = now_t
+
                         caption = build_pseudo_alert(sym, d)
-                        k1_raw  = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                                        {"symbol": sym, "interval": "1m", "limit": 120})
-                        chart   = build_pseudo_chart(sym, k1_raw, d) if k1_raw else None
+                        chart   = build_pseudo_chart(sym, k1_early, d) if k1_early else None
                         if chart:
                             send_photo(chart, caption)
                         else:
                             send_message(caption)
-                        print(f"  [PSEUDO] ⚠️ {sym} псевдопамп {d['score']}/4 крит"
-                              f" +{d['pump_pct']}% за {d['pump_mins']}мин")
+                        print(f"  [PSEUDO] ⚠️ {sym} РАННИЙ СИГНАЛ {d['score']}/4"
+                              f" +{d['pump_pct']}% peak={d['peak_high']:.6g}")
 
                         # Сохраняем первый скрин в PostgreSQL
                         if _PUMP_DB_AVAILABLE:
                             try:
-                                db = _get_pump_db()
-                                eid = db.save_start(sym, d, chart)
-                                # Запоминаем event_id в кэше монеты
+                                eid = _get_pump_db().save_start(sym, d, chart)
                                 d["_db_event_id"] = eid
                             except Exception as _dbe:
                                 print(f"  [DB ERR] {_dbe}")
 
-                    with pseudo_lock:
-                        pseudo_coins[sym] = {**d, "since": time.time()}
+                elif is_new and not early_dump:
+                    # Памп есть, но слив ещё не подтверждён — молчим, просто запоминаем
+                    print(f"  [PSEUDO] 👀 {sym} памп обнаружен, жду подтверждения слива")
 
-                # ── Алерт: цена вернулась к ретест-зоне хая ──
-                close_now = d["close_now"]
-                if d["retest_low"] <= close_now <= d["retest_high"]:
-                    key = f"pseudo_retest_{sym}"
-                    now = time.time()
-                    if now - pseudo_alert_cache.get(key, 0) >= 180:
-                        pseudo_alert_cache[key] = now
+                with pseudo_lock:
+                    pseudo_coins[sym] = {**d,
+                                         "since": time.time(),
+                                         "_db_event_id": d.get("_db_event_id")
+                                                         or (prev or {}).get("_db_event_id")}
+
+                # ── ФИНАЛЬНЫЙ АЛЕРТ: цена вернулась к pre-pump зоне ──
+                # Это итоговое сообщение — шлём ОДИН раз, без повторов
+                at_prepump = d["pre_pump_low"] * 0.995 <= close_now <= d["pre_pump_high"] * 1.005
+
+                if at_prepump:
+                    final_key = f"pseudo_final_{sym}"
+                    now_t = time.time()
+                    # Кулдаун 1 час — больше не спамим по этому событию
+                    if now_t - pseudo_alert_cache.get(final_key, 0) >= 3600:
+                        pseudo_alert_cache[final_key] = now_t
+
+                        # Сколько минут потребовалось вернуться
+                        since_peak = round((now_t - (prev or d).get("since", now_t)) / 60)
+
                         msg = (
+                            f"📉 <code>{sym}</code> · ПСЕВДОПАМП — цена вернулась к старту\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"Хай пампа: <b>{d['peak_high']:.6g}</b>\n"
+                            f"Pre-pump зона: <b>{d['pre_pump_low']:.6g} – {d['pre_pump_high']:.6g}</b>\n"
+                            f"Текущая цена: <b>{close_now:.6g}</b>\n"
+                            f"Время от хая: <b>~{since_peak}мин</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"✅ Шорт отработан · ждём продолжения или выхода\n"
+                            f"💎 <code>{sym.replace('USDT', '')}</code>"
+                        )
+                        k1_fin = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                                       {"symbol": sym, "interval": "1m", "limit": 120})
+                        chart_fin = build_pseudo_chart(sym, k1_fin, d) if k1_fin else None
+                        if chart_fin:
+                            send_photo(chart_fin, msg)
+                        else:
+                            send_message(msg)
+                        print(f"  [PSEUDO] ✅ {sym} цена вернулась к старту пампа")
+
+                        # Сохраняем финальный скрин в PostgreSQL
+                        if _PUMP_DB_AVAILABLE:
+                            try:
+                                eid = (prev or d).get("_db_event_id")
+                                if eid:
+                                    _get_pump_db().save_end(eid, close_now, chart_fin,
+                                                            outcome="prepump_long")
+                            except Exception as _dbe:
+                                print(f"  [DB ERR end] {_dbe}")
+
+                # ── РЕТЕСТ ХАЯ: цена вернулась в шорт-зону (отдельный случай) ──
+                # Шлём только если до этого НЕ было финального алерта
+                at_retest = d["retest_low"] <= close_now <= d["retest_high"]
+                final_sent = pseudo_alert_cache.get(f"pseudo_final_{sym}", 0) > \
+                             pseudo_alert_cache.get(f"pseudo_retest_{sym}", 0)
+
+                if at_retest and not final_sent:
+                    key = f"pseudo_retest_{sym}"
+                    now_t = time.time()
+                    if now_t - pseudo_alert_cache.get(key, 0) >= 600:
+                        pseudo_alert_cache[key] = now_t
+                        msg_r = (
                             f"🎯 <code>{sym}</code> · РЕТЕСТ ХАЯ ПСЕВДОПАМПА\n"
-                            f"Цена вернулась к зоне шорта: "
-                            f"<b>{d['retest_low']:.6g}–{d['retest_high']:.6g}</b>\n"
+                            f"Шорт-зона: <b>{d['retest_low']:.6g}–{d['retest_high']:.6g}</b>\n"
                             f"Цель: {d['pre_pump_low']:.6g} · "
                             f"Стоп: {round(d['peak_high'] * 1.005, 8):.6g}\n"
-                            f"⚠️ Инициирован псевдопамп — зона для шорта"
+                            f"⚠️ Зона для входа в шорт"
                         )
                         k1_rt = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                                       {"symbol": sym, "interval": "1m", "limit": 120})
                         chart_rt = build_pseudo_chart(sym, k1_rt, d) if k1_rt else None
                         if chart_rt:
-                            send_photo(chart_rt, msg)
+                            send_photo(chart_rt, msg_r)
                         else:
-                            send_message(msg)
-                        print(f"  [PSEUDO] 🎯 {sym} ретест хая псевдопампа")
+                            send_message(msg_r)
+                        print(f"  [PSEUDO] 🎯 {sym} ретест хая")
 
-                        # Сохраняем финальный скрин в PostgreSQL
                         if _PUMP_DB_AVAILABLE:
                             try:
-                                eid = d.get("_db_event_id") or (prev or {}).get("_db_event_id")
+                                eid = (prev or d).get("_db_event_id")
                                 if eid:
                                     _get_pump_db().save_end(eid, close_now, chart_rt,
                                                             outcome="retest_short")
-                            except Exception as _dbe:
-                                print(f"  [DB ERR end] {_dbe}")
-
-                # ── Алерт: цена вернулась к pre-pump зоне ──
-                if d["pre_pump_low"] * 0.995 <= close_now <= d["pre_pump_high"] * 1.005:
-                    key = f"pseudo_prepump_{sym}"
-                    now = time.time()
-                    if now - pseudo_alert_cache.get(key, 0) >= 180:
-                        pseudo_alert_cache[key] = now
-                        msg = (
-                            f"📈 <code>{sym}</code> · PRE-PUMP УРОВЕНЬ\n"
-                            f"Цена у старта пампа: "
-                            f"<b>{d['pre_pump_low']:.6g}–{d['pre_pump_high']:.6g}</b>\n"
-                            f"Маркетмейкер закрывает шорты здесь → лонг\n"
-                            f"Цель: +4% · Стоп: ниже {round(d['pre_pump_low'] * 0.993, 8):.6g}\n"
-                            f"💎 <code>{sym.replace('USDT', '')}</code>"
-                        )
-                        k1_pp = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                                      {"symbol": sym, "interval": "1m", "limit": 120})
-                        chart_pp = build_pseudo_chart(sym, k1_pp, d) if k1_pp else None
-                        if chart_pp:
-                            send_photo(chart_pp, msg)
-                        else:
-                            send_message(msg)
-                        print(f"  [PSEUDO] 📈 {sym} pre-pump уровень достигнут")
-
-                        # Сохраняем финальный скрин в PostgreSQL
-                        if _PUMP_DB_AVAILABLE:
-                            try:
-                                eid = d.get("_db_event_id") or (prev or {}).get("_db_event_id")
-                                if eid:
-                                    _get_pump_db().save_end(eid, close_now, chart_pp,
-                                                            outcome="prepump_long")
                             except Exception as _dbe:
                                 print(f"  [DB ERR end] {_dbe}")
 
