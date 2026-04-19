@@ -124,6 +124,20 @@ proxy_lock   = threading.Lock()
 current_proxy = {"http": None, "https": None}
 PROXY_LIST: list = []
 
+# ── Платные Webshare-прокси (формат ip:port:user:pass) ──
+WEBSHARE_PROXIES = [
+    "31.59.20.176:6754:yjpyqacj:4qhho7l230x1",
+    "198.23.239.134:6540:yjpyqacj:4qhho7l230x1",
+    "45.38.107.97:6014:yjpyqacj:4qhho7l230x1",
+    "107.172.163.27:6543:yjpyqacj:4qhho7l230x1",
+    "198.105.121.200:6462:yjpyqacj:4qhho7l230x1",
+    "216.10.27.159:6837:yjpyqacj:4qhho7l230x1",
+    "142.111.67.146:5611:yjpyqacj:4qhho7l230x1",
+    "191.96.254.138:6185:yjpyqacj:4qhho7l230x1",
+    "31.58.9.4:6077:yjpyqacj:4qhho7l230x1",
+    "23.26.71.145:5628:yjpyqacj:4qhho7l230x1",
+]
+
 http_session = requests.Session()
 http_session.headers.update({"User-Agent": "CryptoScreener/4.0"})
 
@@ -131,7 +145,31 @@ http_session.headers.update({"User-Agent": "CryptoScreener/4.0"})
 #  ПРОКСИ
 # ─────────────────────────────────────────────
 
+def _webshare_to_proxy_dict(entry: str) -> dict:
+    """Конвертирует 'ip:port:user:pass' в requests-совместимый dict."""
+    parts = entry.strip().split(":")
+    if len(parts) == 4:
+        ip, port, user, pwd = parts
+        url = f"http://{user}:{pwd}@{ip}:{port}"
+        return {"http": url, "https": url}
+    # fallback: ip:port без авторизации
+    ip, port = parts[0], parts[1]
+    url = f"http://{ip}:{port}"
+    return {"http": url, "https": url}
+
+
+def test_proxy(proxy_dict: dict) -> bool:
+    """Проверяет прокси-запросом к Binance."""
+    try:
+        r = requests.get(f"{BINANCE_BASE}/fapi/v1/ping",
+                         proxies=proxy_dict, timeout=6)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def fetch_free_proxies():
+    """Загружает бесплатные прокси как резерв (если Webshare недоступны)."""
     global PROXY_LIST
     sources = [
         "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
@@ -150,36 +188,65 @@ def fetch_free_proxies():
             print(f"  [PROXY FETCH ERR] {e}")
     random.shuffle(proxies)
     PROXY_LIST = proxies[:150]
-    print(f"  [PROXY] Загружено: {len(PROXY_LIST)}")
-
-
-def test_proxy(proxy_str):
-    proxy = {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}"}
-    try:
-        r = requests.get(f"{BINANCE_BASE}/fapi/v1/ping", proxies=proxy, timeout=6)
-        return r.status_code == 200
-    except Exception:
-        return False
+    print(f"  [PROXY] Резерв загружен: {len(PROXY_LIST)}")
 
 
 def find_working_proxy():
+    """
+    Ищет рабочий прокси. Приоритет:
+      1. Webshare (платные, с авторизацией) — проверяем все по кругу
+      2. Бесплатные из PROXY_LIST — как резерв
+    """
     global current_proxy
-    print("  [PROXY] Ищу рабочий прокси...")
-    for p in PROXY_LIST:
-        if test_proxy(p):
+
+    # 1. Пробуем Webshare в случайном порядке
+    shuffled = WEBSHARE_PROXIES[:]
+    random.shuffle(shuffled)
+    for entry in shuffled:
+        pd = _webshare_to_proxy_dict(entry)
+        if test_proxy(pd):
             with proxy_lock:
-                current_proxy = {"http": f"http://{p}", "https": f"http://{p}"}
-            print(f"  [PROXY] ✅ {p}")
+                current_proxy = pd
+            ip_short = entry.split(":")[0]
+            print(f"  [PROXY] ✅ Webshare: {ip_short}")
             return True
-    print("  [PROXY] ❌ Не найден, работаю без прокси")
+
+    print("  [PROXY] ⚠️ Webshare недоступен, пробую резерв...")
+
+    # 2. Резервные бесплатные
+    for p in PROXY_LIST:
+        pd = {"http": f"http://{p}", "https": f"http://{p}"}
+        if test_proxy(pd):
+            with proxy_lock:
+                current_proxy = pd
+            print(f"  [PROXY] ✅ Резерв: {p}")
+            return True
+
+    print("  [PROXY] ❌ Рабочий прокси не найден, работаю напрямую")
     with proxy_lock:
         current_proxy = {"http": None, "https": None}
     return False
 
 
 def refresh_proxies():
+    """Обновляет резервный список и переключает прокси."""
     fetch_free_proxies()
     find_working_proxy()
+
+
+def proxy_watchdog_loop():
+    """
+    Каждые 10 минут проверяет текущий прокси и переключает если упал.
+    Гарантирует что бот всегда идёт через Webshare.
+    """
+    import time as _time
+    while True:
+        _time.sleep(600)
+        with proxy_lock:
+            pd = dict(current_proxy)
+        if not test_proxy(pd):
+            print("  [PROXY] ⚡ Текущий прокси упал, ищу замену...")
+            find_working_proxy()
 
 
 # ─────────────────────────────────────────────
@@ -4499,6 +4566,9 @@ def main():
 
     # Детектор расхождений mark/index
     threading.Thread(target=deviation_scan_loop, args=(symbols_ref,), daemon=True).start()
+
+    # Watchdog прокси — переключает Webshare если упал
+    threading.Thread(target=proxy_watchdog_loop, daemon=True).start()
 
     # SPLASH-детектор (резкие движения ≥9% за 1-5 мин)
     threading.Thread(target=splash_loop, args=(symbols_ref,), daemon=True).start()
