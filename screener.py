@@ -353,12 +353,13 @@ def find_pivots(candles, tf_label, min_touches=2):
     return levels
 
 def collect_levels(symbol, k1):
-    levels = find_pivots(k1[-100:], "1m")
+    pivot = find_pivots(k1[-100:], "1m")
     k5  = fetch(f"{BINANCE_BASE}/fapi/v1/klines", {"symbol": symbol, "interval": "5m",  "limit": 100})
     k15 = fetch(f"{BINANCE_BASE}/fapi/v1/klines", {"symbol": symbol, "interval": "15m", "limit": 100})
-    if k5:  levels += find_pivots(k5,  "5m")
-    if k15: levels += find_pivots(k15, "15m")
-    return levels
+    if k5:  pivot += find_pivots(k5,  "5m")
+    if k15: pivot += find_pivots(k15, "15m")
+    # Обогащаем: добавляем уровни тел + заколы хвостами
+    return enrich_levels_with_body(k1, pivot)
 
 def nearest_level(close, levels):
     if not levels: return None, None
@@ -514,7 +515,8 @@ def draw_volume_profile(ax, candles, n_bins=40, alpha=0.25, poc_color="#ffd700")
             bbox=dict(facecolor="#0d1117", alpha=0.7, pad=1, edgecolor="none"))
 
 
-def build_chart(symbol, candles, levels=None):
+def build_chart(symbol, candles, levels=None, alert_type="inplay"):
+    """Универсальный график 1m. alert_type задаёт цвет заголовка."""
     try:
         if not candles or len(candles) < 5:
             print(f"  [CHART] {symbol}: недостаточно свечей ({len(candles) if candles else 0})")
@@ -585,9 +587,33 @@ def build_chart(symbol, candles, levels=None):
         # Volume Profile (после установки xlim — обязательно)
         draw_volume_profile(ax1, data)
 
+        # Body-уровни (если есть в levels)
+        body_lvs = [lv for lv in (levels or []) if lv.get("type") in ("body", "body_cluster")]
+        pmn_b, pmx_b = min(lows), max(highs)
+        margin_b = (pmx_b - pmn_b) * 0.3
+        for blv in body_lvs:
+            if not (pmn_b - margin_b <= blv["price"] <= pmx_b + margin_b):
+                continue
+            is_cluster = blv.get("cluster", False)
+            bcolor = "#a78bfa" if is_cluster else "#7c3aed"
+            ax1.axhline(y=blv["price"], color=bcolor,
+                        lw=1.8 if is_cluster else 1.1, ls="-", alpha=0.85, zorder=5)
+            # Зона хвостового закола ниже тела
+            ax1.axhspan(blv["price"] * 0.9985, blv["price"],
+                        alpha=0.05, color=bcolor, zorder=3)
+            rej = blv.get("wick_rejects", 0)
+            cnt = blv.get("count", blv.get("candle_count", "?"))
+            ax1.text(n - 0.5, blv["price"],
+                     f" {blv['price']:.6g} ×{cnt}св{'  кластер' if is_cluster else ''}{'  ↩'+str(rej) if rej else ''}",
+                     color=bcolor, fontsize=6, va="center",
+                     bbox=dict(facecolor="#0d1117", alpha=0.55, pad=1, edgecolor="none"))
+
         ax1.legend(loc="upper left", fontsize=7, facecolor="#161b22",
                    edgecolor="#30363d", labelcolor="white", framealpha=0.7)
-        ax1.set_title(f"{symbol} · 1m", color="#e6edf3", fontsize=13, fontweight="bold", pad=8)
+        title_color = CHART_TITLE_COLOR.get(alert_type, "#e6edf3")
+        type_emoji  = ALERT_EMOJI.get(alert_type, "📊")
+        ax1.set_title(f"{type_emoji} {symbol} · 1m",
+                      color=title_color, fontsize=13, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
         ax2.set_ylabel("Vol USD",  color="#8b949e", fontsize=9)
         plt.tight_layout(pad=1.2)
@@ -619,6 +645,66 @@ def send_message(text):
             print(f"  [TG ERR] {r.json()}")
     except Exception as e:
         print(f"  [TG EXC] {e}")
+
+
+# ─────────────────────────────────────────────
+#  СТИЛИ УВЕДОМЛЕНИЙ (Вариант A + B)
+# ─────────────────────────────────────────────
+
+# Вариант A — эмодзи-маркеры (видны в ленте без открытия сообщения)
+ALERT_EMOJI = {
+    "inplay":       "🟢",
+    "pseudo":       "🔵",
+    "splash":       "🔴",
+    "deviation":    "🟡",
+    "zone":         "🔵",
+    "stats":        "⚪",
+    "broken":       "🔴",
+    "approach":     "🟢",
+    "zone_update":  "🟢",
+    "zone_broken":  "🔴",
+    "short_entry":  "🔴",   # агрессивный сигнал шорта
+}
+
+ALERT_DIV = {
+    "inplay":       "═",
+    "pseudo":       "─",
+    "splash":       "▓",
+    "deviation":    "·",
+    "zone":         "─",
+    "stats":        "─",
+    "broken":       "▓",
+    "approach":     "═",
+    "zone_update":  "═",
+    "zone_broken":  "▓",
+    "short_entry":  "▓",   # как SPLASH — агрессивный
+}
+
+CHART_TITLE_COLOR = {
+    "inplay":       "#26a69a",
+    "pseudo":       "#2196F3",
+    "splash":       "#ef5350",
+    "deviation":    "#FFD700",
+    "broken":       "#ef5350",
+    "approach":     "#26a69a",
+    "zone_update":  "#26a69a",
+    "zone_broken":  "#ef5350",
+    "zone":         "#2196F3",
+    "short_entry":  "#ef5350",   # красный — вход в шорт
+}
+
+def make_divider(alert_type: str, width: int = 19) -> str:
+    """Возвращает разделитель нужного стиля нужной ширины."""
+    char = ALERT_DIV.get(alert_type, "─")
+    return char * width
+
+def make_header(alert_type: str, symbol: str, title: str) -> str:
+    """
+    Формирует заголовок с эмодзи-маркером (Вариант A) + жирный текст.
+    Пример: 🟢🟢🟢 ИНПЛЕЙ · HEIUSDT 🟢🟢🟢
+    """
+    em = ALERT_EMOJI.get(alert_type, "📊")
+    return f"{em}{em}{em} <b>{title} · <code>{symbol}</code></b> {em}{em}{em}"
 
 
 # ─────────────────────────────────────────────
@@ -654,30 +740,31 @@ def build_layer1_alert(symbol, vol_mult_val, trigger):
 def build_layer3_alert(symbol, close, level, dist_pct, natr, vol_mult_val,
                        last_1m_vol_usd, cvd, pattern_name, trend, ob_pressure,
                        touch_num, stars, mode, candles_count):
-    coin = symbol.replace("USDT", "")
+    coin  = symbol.replace("USDT", "")
     ltype = "поддержка" if level["type"] == "sup" else "сопротивление"
+    div   = make_divider("inplay")
 
     if mode == "WILD":
-        header = f"⚡️ WILD · <b>{symbol}</b> · {stars_str(stars)}"
+        header    = make_header("inplay", symbol, f"⚡ WILD · {stars_str(stars)}")
         mode_line = f"Режим: <b>ДИКАЯ ВОЛАТИЛЬНОСТЬ</b> (NATR {natr}%)"
-        warning = ("\n━━━━━━━━━━━━━━━━━━━\n"
-                   f"⚠️ Высокий NATR: сквиз может быть 3–5%\n"
-                   f"Ставь лимит у уровня, стакан обязателен")
+        warning   = (f"\n{div}\n"
+                     f"⚠️ Высокий NATR: сквиз может быть 3–5%\n"
+                     f"Ставь лимит у уровня, стакан обязателен")
     elif mode == "HOT":
-        header = f"🔥 HOT · <b>{symbol}</b> · {stars_str(stars)}"
+        header    = make_header("inplay", symbol, f"🔥 HOT · {stars_str(stars)}")
         mode_line = f"Режим: <b>повышенная волатильность</b> (NATR {natr}%)"
-        warning = ""
+        warning   = ""
     else:
         touch_label = {1: "1й вход", 2: "2е касание ✅", 3: "3е касание 🎯"}.get(touch_num, f"касание {touch_num}")
-        header = f"📍 <b>{symbol}</b> · {touch_label} · {stars_str(stars)}"
+        header    = make_header("inplay", symbol, f"{touch_label} · {stars_str(stars)}")
         mode_line = f"Режим: нормальный (NATR {natr}%)"
-        warning = ""
+        warning   = ""
 
     squeeze_hint = "· сквизует к уровню" if dist_pct < radius_for_mode(mode) / 2 else ""
 
     lines = [
         header,
-        "━━━━━━━━━━━━━━━━━━━",
+        div,
         mode_line,
         f"Цена: <b>{close:.6g}</b> {squeeze_hint}",
         f"Уровень: <b>{level['price']:.6g}</b> [{level['tf']}] · расстояние: <b>{dist_pct}%</b> ({ltype})",
@@ -1098,7 +1185,8 @@ def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
 
     print(f"  [L3] 🎯 {symbol} | {mode} | касание {touch_num} | ⭐{stars} | dist={dist_pct}%")
 
-    chart = build_chart(symbol, k1, state.get("levels", []))
+    chart = build_chart(symbol, k1, state.get("levels", []),
+                        alert_type="inplay")
     if chart:
         send_photo(chart, caption)
     else:
@@ -1177,6 +1265,118 @@ def find_broken_levels(k1, k5, k15, current_price):
     return broken
 
 
+def find_body_levels(k1, min_cluster=3, tol_pct=0.15):
+    """
+    Находит уровни по ЗАКРЫТИЯМ ТЕЛ свечей (не по хвостам).
+
+    Алгоритм:
+    1. Берём closes всех свечей
+    2. Ищем кластеры: 2+ свечи подряд где |close[i] - close[j]| / close < tol_pct%
+    3. Медиана close кластера = уровень
+    4. Хвосты игнорируются при построении — они нужны только для detect_wick_rejects
+
+    Возвращает список dict: price, candle_count, strength
+    """
+    if not k1 or len(k1) < min_cluster:
+        return []
+
+    closes = [float(c[4]) for c in k1]
+    n = len(closes)
+    used = [False] * n
+    levels = []
+
+    for i in range(n):
+        if used[i]:
+            continue
+        cluster = [i]
+        ref = closes[i]
+        for j in range(i + 1, min(i + 20, n)):
+            if used[j]:
+                break
+            if abs(closes[j] - ref) / ref * 100 <= tol_pct:
+                cluster.append(j)
+            elif len(cluster) >= 2:
+                break   # разрыв — останавливаемся
+
+        if len(cluster) < min_cluster:
+            continue
+
+        for idx in cluster:
+            used[idx] = True
+
+        price = sorted([closes[k] for k in cluster])[len(cluster) // 2]  # медиана
+        # Сила уровня: кол-во свечей + бонус за длину
+        strength = len(cluster) + (2 if len(cluster) >= 5 else 0)
+        levels.append({
+            "price":        round(price, 8),
+            "candle_count": len(cluster),
+            "strength":     strength,
+            "tf":           "1m",
+            "type":         "body",
+        })
+
+    return levels
+
+
+def detect_wick_rejects(k1, level_price, tol_pct=0.15):
+    """
+    Считает кол-во заколов хвостами у уровня:
+    закол = low пробивал уровень (low < level - tol), но close закрылся выше.
+    Это паттерн «закол → возврат» — подтверждение реального уровня по телам.
+
+    Возвращает: count (int), последние ts заколов (list)
+    """
+    count = 0
+    tol   = level_price * (tol_pct / 100)
+    times = []
+    for c in k1:
+        low   = float(c[3])
+        close = float(c[4])
+        if low < level_price - tol and close > level_price:
+            count += 1
+            times.append(int(c[0]))
+    return count, times
+
+
+def cluster_body_levels(levels, tol_pct=0.20):
+    """
+    Объединяет body-уровни попавшие в ±tol_pct% друг от друга в кластер.
+    Вес кластера = сумма strength. ZQ-бонус считается снаружи.
+    Возвращает список кластеров отсортированных по цене.
+    """
+    if not levels:
+        return []
+
+    sorted_lv = sorted(levels, key=lambda x: x["price"])
+    clusters  = []
+    cur       = [sorted_lv[0]]
+
+    for lv in sorted_lv[1:]:
+        ref = cur[0]["price"]
+        if abs(lv["price"] - ref) / ref * 100 <= tol_pct:
+            cur.append(lv)
+        else:
+            clusters.append(cur)
+            cur = [lv]
+    clusters.append(cur)
+
+    result = []
+    for cl in clusters:
+        prices    = [x["price"] for x in cl]
+        total_str = sum(x["strength"] for x in cl)
+        result.append({
+            "price":        round(sorted([prices[len(prices)//2]])[0], 8),
+            "price_min":    min(prices),
+            "price_max":    max(prices),
+            "count":        len(cl),
+            "strength":     total_str,
+            "cluster":      len(cl) >= 3,   # True = кластер, False = одиночный уровень
+            "tf":           "1m",
+            "type":         "body_cluster" if len(cl) >= 3 else "body",
+        })
+    return result
+
+
 def find_round_numbers_in_zone(low, high):
     """Находит круглые числа внутри зоны."""
     rounds = []
@@ -1227,7 +1427,169 @@ def find_inner_levels(k1, k5, zone_low, zone_high):
     return deduped
 
 
-def get_open_interest(symbol):
+def find_body_levels(k1, min_cluster: int = 3, tol_pct: float = 0.15) -> list:
+    """
+    Ищет уровни по ЗАКРЫТИЯМ тел свечей (не хвостам).
+
+    Алгоритм:
+    1. Берём close каждой свечи.
+    2. Ищем кластеры: 3+ последовательных close в пределах tol_pct% друг от друга
+       → медиана кластера = уровень тела.
+    3. Хвосты (low/high) не используются для построения, только для подтверждения заколов.
+
+    Возвращает список dict: price, tf, type, touches, wick_rejects, source="body"
+    """
+    if not k1 or len(k1) < min_cluster + 2:
+        return []
+
+    closes = [float(c[4]) for c in k1]
+    n = len(closes)
+    levels = []
+    i = 0
+
+    while i < n:
+        # Пытаемся вырастить кластер начиная с i
+        group = [closes[i]]
+        j = i + 1
+        while j < n:
+            ref = group[0]
+            if abs(closes[j] - ref) / ref * 100 <= tol_pct:
+                group.append(closes[j])
+                j += 1
+            else:
+                break
+
+        if len(group) >= min_cluster:
+            import statistics
+            med_price = statistics.median(group)
+            # Определяем тип: если медиана выше текущей цены — сопротивление
+            cur_close = closes[-1]
+            ltype = "res" if med_price > cur_close else "sup"
+            levels.append({
+                "price":        round(med_price, 10),
+                "tf":           "1m",
+                "type":         ltype,
+                "touches":      len(group),
+                "wick_rejects": 0,         # заполняется ниже
+                "source":       "body",
+                "hold_mins":    len(group),  # примерная ширина кластера в минутах
+            })
+            i = j  # прыгаем за кластер
+        else:
+            i += 1
+
+    return levels
+
+
+def detect_wick_rejects(k1, level_price: float, tol_pct: float = 0.15) -> int:
+    """
+    Считает количество «заколов» — свечей где:
+      - low пробивал уровень (хвост ниже линии тела), НО
+      - close закрылся ВЫШЕ уровня.
+    Это паттерн «закол → возврат», подтверждающий рабочий уровень.
+    """
+    count = 0
+    for c in k1:
+        low_   = float(c[3])
+        close_ = float(c[4])
+        # Хвост ушёл ниже уровня, а тело закрылось выше
+        if low_ < level_price * (1 - tol_pct / 100) and close_ > level_price:
+            count += 1
+    return count
+
+
+def cluster_body_levels(levels: list, tol_pct: float = 0.2) -> list:
+    """
+    Объединяет уровни тел которые попадают в ±tol_pct% в один кластер.
+    Вес кластера = сумма touches. Кластер из 3+ уровней получает cluster_bonus=True.
+    """
+    if not levels:
+        return []
+
+    sorted_lv = sorted(levels, key=lambda x: x["price"])
+    clusters  = []
+    group     = [sorted_lv[0]]
+
+    for lv in sorted_lv[1:]:
+        ref = group[0]["price"]
+        if abs(lv["price"] - ref) / ref * 100 <= tol_pct:
+            group.append(lv)
+        else:
+            clusters.append(group)
+            group = [lv]
+    clusters.append(group)
+
+    result = []
+    for grp in clusters:
+        import statistics
+        merged_price = statistics.median(p["price"] for p in grp)
+        total_touches = sum(p["touches"] for p in grp)
+        wick_total = sum(p.get("wick_rejects", 0) for p in grp)
+        ltype = grp[0]["type"]
+        hold  = max(p.get("hold_mins", 0) for p in grp)
+        result.append({
+            "price":         round(merged_price, 10),
+            "tf":            "1m",
+            "type":          ltype,
+            "touches":       total_touches,
+            "wick_rejects":  wick_total,
+            "cluster_bonus": len(grp) >= 3,   # ZQ +2 если 3+ уровня слились
+            "source":        "body",
+            "hold_mins":     hold,
+        })
+
+    return result
+
+
+def enrich_levels_with_body(k1: list, pivot_levels: list) -> list:
+    """
+    Основная точка входа: объединяет пивот-уровни (по хвостам) с уровнями тел.
+    Для каждого уровня добавляет wick_rejects и флаг source.
+    Уровни тел имеют приоритет при отображении — они точнее.
+    """
+    # 1. Уровни тел
+    body_raw    = find_body_levels(k1, min_cluster=3, tol_pct=0.15)
+    body_merged = cluster_body_levels(body_raw, tol_pct=0.2)
+
+    # 2. Добавляем заколы к уровням тел
+    for lv in body_merged:
+        lv["wick_rejects"] = detect_wick_rejects(k1, lv["price"])
+
+    # 3. Добавляем заколы к пивот-уровням (они по хвостам, нужны для справки)
+    for lv in pivot_levels:
+        if "wick_rejects" not in lv:
+            lv["wick_rejects"] = detect_wick_rejects(k1, lv["price"])
+        if "source" not in lv:
+            lv["source"] = "pivot"
+
+    # 4. Убираем пивот-уровни которые дублируют уровни тел (в пределах 0.2%)
+    deduped_pivots = []
+    for pv in pivot_levels:
+        if not any(abs(pv["price"] - bl["price"]) / bl["price"] * 100 < 0.2
+                   for bl in body_merged):
+            deduped_pivots.append(pv)
+
+    return body_merged + deduped_pivots
+
+
+def zq_bonus_body_levels(body_levels: list) -> tuple[int, list]:
+    """
+    Возвращает (score_delta, flags) для ZQ на основе уровней тел.
+    +2 за кластер из 3+ уровней, +1 за 2+ заколов хвостами.
+    """
+    score = 0
+    flags = []
+    for lv in body_levels:
+        if lv.get("cluster_bonus"):
+            score += 2
+            flags.append(f"✅ Кластер тел ×{lv['touches']} у {lv['price']:.6g} (+2 ZQ)")
+            break   # считаем только один самый сильный кластер
+    for lv in body_levels:
+        if lv.get("wick_rejects", 0) >= 2:
+            score += 1
+            flags.append(f"✅ Заколы хвостами ×{lv['wick_rejects']} — уровень рабочий (+1 ZQ)")
+            break
+    return min(score, 3), flags
     """Получает историю OI за последние 30 минут (5m свечи)."""
     data = fetch("https://fapi.binance.com/futures/data/openInterestHist",
                  {"symbol": symbol, "period": "5m", "limit": 10})
@@ -1351,10 +1713,12 @@ def detect_peak_consolidation(k1, natr):
 
 
 def calc_zone_quality(k1, k5, natr, zone_high, zone_low,
-                      broken_levels, oi_score, peak_score):
+                      broken_levels, oi_score, peak_score,
+                      body_in_zone=None):
     """
     Zone Quality Score 0–10.
     Агрегирует все факторы надёжности зоны.
+    body_in_zone — body-уровни внутри зоны (из find_body_levels).
     """
     zone_pct = (zone_high - zone_low) / zone_high * 100
     score    = 5.0  # базовый
@@ -1403,6 +1767,24 @@ def calc_zone_quality(k1, k5, natr, zone_high, zone_low,
     # OI и пик
     score += oi_score
     score += peak_score
+
+    # ── Бонус за body-уровни и заколы хвостами ──
+    if body_in_zone:
+        clusters = [b for b in body_in_zone if b.get("cluster")]
+        singletons = [b for b in body_in_zone if not b.get("cluster")]
+        if clusters:
+            score += 2
+            flags.append(f"✅ Кластер тел ({clusters[0]['count']}+ свечей) в зоне — сильная поддержка")
+        elif singletons:
+            score += 1
+            flags.append(f"✅ Body-уровень в зоне ({singletons[0].get('candle_count', singletons[0].get('count', '?'))} свечей)")
+        total_rejects = sum(b.get("wick_rejects", 0) for b in body_in_zone)
+        if total_rejects >= 3:
+            score += 2
+            flags.append(f"✅ Заколов хвостами: {total_rejects} — закол-и-возврат подтверждён")
+        elif total_rejects >= 1:
+            score += 1
+            flags.append(f"🟡 Заколов хвостами: {total_rejects}")
 
     score = max(0, min(10, round(score)))
 
@@ -1535,8 +1917,9 @@ def calc_squeeze_depth(zone_low, zone_high, inner_levels, round_nums, natr):
 
 
 def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
-                       round_nums, limits, broken_levels):
-    """График с зоной, уровнями и лимитками."""
+                       round_nums, limits, broken_levels,
+                       body_levels=None, alert_type="inplay"):
+    """График с зоной, уровнями, лимитками и body-уровнями."""
     try:
         data   = k1[-80:]
         n      = len(data)
@@ -1546,6 +1929,163 @@ def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
         closes = [float(c[4]) for c in data]
         dvols  = [float(c[7]) for c in data]
         times  = [datetime.utcfromtimestamp(int(c[0])/1000) for c in data]
+
+        if max(highs) == 0:
+            return None
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
+                                        gridspec_kw={"height_ratios": [3, 1]},
+                                        facecolor="#0d1117")
+        ax1.set_facecolor("#0d1117")
+        ax2.set_facecolor("#0d1117")
+        w = 0.6
+
+        for i in range(n):
+            color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
+            ax1.plot([i, i], [lows[i], highs[i]], color=color, lw=0.8)
+            bh = abs(closes[i]-opens[i]) or (highs[i]-lows[i])*0.01
+            ax1.add_patch(Rectangle((i-w/2, min(opens[i], closes[i])), w, bh,
+                                     facecolor=color, edgecolor=color))
+            ax2.bar(i, dvols[i], color=color, width=w, alpha=0.85)
+
+        # VWAP
+        vwap_vals = calc_vwap(data)
+        ax1.plot(range(n), vwap_vals, color="#ff9800", lw=1.2,
+                 ls="--", alpha=0.85, zorder=6)
+
+        # ── Body-уровни (рисуем ДО зоны чтобы зона перекрывала) ──
+        if body_levels:
+            pmn, pmx = min(lows), max(highs)
+            margin   = (pmx - pmn) * 0.3
+            visible_body = [b for b in body_levels
+                            if pmn - margin <= b["price"] <= pmx + margin]
+            for blv in visible_body:
+                is_cluster = blv.get("cluster", False)
+                rejects    = blv.get("wick_rejects", 0)
+                bcolor     = "#a78bfa" if is_cluster else "#7c3aed"  # фиолетовый
+                blw        = 1.8 if is_cluster else 1.1
+                # Линия по телу — сплошная
+                ax1.axhline(y=blv["price"], color=bcolor, lw=blw, ls="-",
+                            alpha=0.85, zorder=4)
+                # Зона закола (хвостовая) — пунктир серый ниже тела
+                tail_low = blv["price"] * 0.9985   # ~0.15% ниже
+                ax1.axhspan(tail_low, blv["price"], alpha=0.05,
+                            color=bcolor, zorder=3)
+                # Подпись
+                label_parts = [f" {blv['price']:.6g}"]
+                cnt = blv.get("count", blv.get("candle_count", "?"))
+                label_parts.append(f"×{cnt}св")
+                if is_cluster:
+                    label_parts.append("кластер")
+                if rejects:
+                    label_parts.append(f"↩{rejects}")
+                ax1.text(n - 0.5, blv["price"], "".join(label_parts),
+                         color=bcolor, fontsize=6, va="center",
+                         bbox=dict(facecolor="#0d1117", alpha=0.55,
+                                   pad=1, edgecolor="none"))
+
+        # Зона входа — закрашенная область
+        zone_color = CHART_TITLE_COLOR.get(alert_type, "#ffd700")
+        ax1.axhspan(zone_low, zone_high, alpha=0.12, color=zone_color, zorder=5)
+        ax1.axhline(y=zone_high, color=zone_color, lw=2.0, ls="-",  zorder=7,
+                    label=f"Зона верх {zone_high:.6g}")
+        ax1.axhline(y=zone_low,  color=zone_color, lw=2.0, ls="--", zorder=7,
+                    label=f"Зона низ {zone_low:.6g}")
+
+        # Пробитые уровни (стек) — текущей зоны
+        for lv in broken_levels:
+            if lv["price"] != zone_high and lv["price"] != zone_low:
+                ax1.axhline(y=lv["price"], color="#aaaaaa", lw=0.8, ls=":",
+                            alpha=0.6, zorder=4)
+                ax1.text(n-0.5, lv["price"],
+                         f" {lv['price']:.6g} [{lv['tf']}] {lv.get('hold_mins','?')}мин",
+                         color="#aaaaaa", fontsize=6, va="center")
+
+        # Все доп. зоны ниже текущей (поддержки для zone_broken)
+        pmn, pmx = min(lows), max(highs)
+        margin   = (pmx - pmn) * 0.25
+        below_all = sorted(
+            [lv for lv in broken_levels
+             if lv["price"] < zone_low * 0.999
+             and lv["price"] >= pmn - margin],
+            key=lambda x: x["price"], reverse=True
+        )
+        zone_colors_below = ["#26a69a", "#00bcd4", "#4fc3f7"]
+        for idx2, lv2 in enumerate(below_all[:3]):
+            c2 = zone_colors_below[min(idx2, 2)]
+            spread = lv2["price"] * 0.003
+            ax1.axhspan(lv2["price"] - spread, lv2["price"] + spread,
+                        alpha=0.10, color=c2, zorder=2)
+            ax1.axhline(y=lv2["price"], color=c2, lw=1.2, ls="--",
+                        alpha=0.85, zorder=5)
+            ax1.text(n - 0.5, lv2["price"],
+                     f" {lv2['price']:.6g} [{lv2['tf']}] ×{lv2.get('touches','?')} {lv2.get('hold_mins','?')}мин",
+                     color=c2, fontsize=6, va="center",
+                     bbox=dict(facecolor="#0d1117", alpha=0.5, pad=1, edgecolor="none"))
+
+        # Внутренние уровни в зоне
+        for lv in inner_levels:
+            ax1.axhline(y=lv["price"], color="#ff8c00", lw=1.0, ls="--",
+                        alpha=0.8, zorder=6)
+            ax1.text(1, lv["price"],
+                     f" {lv['price']:.6g} [{lv['tf']}] слабый",
+                     color="#ff8c00", fontsize=6, va="center")
+
+        # Круглые числа в зоне
+        for r in round_nums:
+            ax1.axhline(y=r, color="#cc44ff", lw=0.8, ls=":",
+                        alpha=0.7, zorder=5)
+            ax1.text(3, r, f" {r:.6g} ○",
+                     color="#cc44ff", fontsize=6, va="center")
+
+        # Лимитки
+        limit_colors = ["#00ff88", "#00cc66", "#009944"]
+        for i, lm in enumerate(limits):
+            color = limit_colors[min(i, 2)]
+            ax1.axhline(y=lm["price"], color=color, lw=1.5, ls="-.",
+                        alpha=0.9, zorder=8)
+            ax1.text(n * 0.3, lm["price"],
+                     f" {lm['label']}: {lm['price']:.6g}",
+                     color=color, fontsize=7, va="bottom", fontweight="bold")
+
+        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: fmt_usd(x)))
+        ticks = list(range(0, n, max(1, n//6)))
+        for ax in [ax1, ax2]:
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([times[i].strftime("%H:%M") for i in ticks],
+                                color="#8b949e", fontsize=8)
+            ax.tick_params(colors="#8b949e", labelsize=8)
+            ax.yaxis.set_tick_params(labelcolor="#8b949e")
+            for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
+            ax.grid(color="#21262d", ls="--", lw=0.5)
+            ax.set_xlim(-1, n)
+
+        ax1.legend(loc="upper left", fontsize=7, facecolor="#161b22",
+                   edgecolor="#30363d", labelcolor="white", framealpha=0.8)
+
+        draw_volume_profile(ax1, data)
+
+        # Цвет заголовка по типу алерта (Вариант В)
+        title_color = CHART_TITLE_COLOR.get(alert_type, "#e6edf3")
+        type_labels = {
+            "inplay":      "ИНПЛЕЙ",
+            "approach":    "ПОДХОД К ЗОНЕ",
+            "zone_update": "ЗОНА ОБНОВЛЕНА",
+            "zone_broken": "ЗОНА ПРОБИТА",
+        }
+        type_label = type_labels.get(alert_type, "ИНПЛЕЙ")
+        ax1.set_title(f"{symbol} · {type_label} · 1m",
+                      color=title_color, fontsize=13, fontweight="bold", pad=8)
+        ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
+        ax2.set_ylabel("Vol USD", color="#8b949e", fontsize=9)
+        plt.tight_layout(pad=1.2)
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
+        plt.close(fig); buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"  [INPLAY CHART ERR {symbol}] {e}")
+        return None
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
                                         gridspec_kw={"height_ratios": [3, 1]},
@@ -1649,8 +2189,8 @@ def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
         # Volume Profile
         draw_volume_profile(ax1, data)
 
-        ax1.set_title(f"{symbol} · ИНПЛЕЙ · 1m", color="#e6edf3",
-                      fontsize=13, fontweight="bold", pad=8)
+        ax1.set_title(f"🟢 {symbol} · ИНПЛЕЙ · 1m",
+                      color=CHART_TITLE_COLOR["inplay"], fontsize=13, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
         ax2.set_ylabel("Vol USD", color="#8b949e", fontsize=9)
         plt.tight_layout(pad=1.2)
@@ -1669,27 +2209,37 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
                        squeeze_prob, sq_details, natr, vol_mult_val,
                        oi_str, oi_details, peak_desc,
                        zq_score, zq_verdict, rec_pct, zq_flags,
-                       alert_type="inplay"):
+                       alert_type="inplay", **kwargs):
     """Строит сообщение инплей-алерта."""
     coin      = symbol.replace("USDT", "")
     zone_pct  = round((zone_high - zone_low) / zone_high * 100, 2)
     dist_high = round((close - zone_high) / zone_high * 100, 2)
     dist_low  = round((close - zone_low)  / zone_low  * 100, 2)
 
+    # Маппинг типа алерта → стиль
+    style_map = {
+        "inplay":      "inplay",
+        "approach":    "approach",
+        "zone_update": "inplay",
+        "zone_broken": "broken",
+    }
+    stype = style_map.get(alert_type, "inplay")
+    div   = make_divider(stype)
+
     if alert_type == "inplay":
-        header = f"🚀 <code>{symbol}</code> · инплей +{pump_pct:.0f}% за {pump_mins}мин"
+        header = make_header("inplay", symbol, f"ИНПЛЕЙ +{pump_pct:.0f}% за {pump_mins}мин")
     elif alert_type == "approach":
-        header = f"⚡️ <code>{symbol}</code> · цена идёт к зоне · −{abs(dist_high):.1f}% до входа"
+        header = make_header("approach", symbol, f"цена к зоне · −{abs(dist_high):.1f}%")
     elif alert_type == "zone_update":
-        header = f"🔄 <code>{symbol}</code> · зона обновлена (новый пробой)"
+        header = make_header("inplay", symbol, "зона обновлена")
     elif alert_type == "zone_broken":
-        header = f"🚨 <code>{symbol}</code> · ЗОНА ПРОБИТА · убирай лимитки!"
+        header = make_header("broken", symbol, "ЗОНА ПРОБИТА · убирай лимитки!")
     else:
-        header = f"📊 <code>{symbol}</code>"
+        header = make_header("inplay", symbol, "инплей")
 
     lines = [
         header,
-        "━━━━━━━━━━━━━━━━━━━",
+        div,
         f"Цена: <b>{close:.6g}</b>  NATR: {natr:.2f}%  Объём: {vol_mult_val:.1f}x",
         "",
         f"📦 Зона: <b>{zone_low:.6g} – {zone_high:.6g}</b> ({zone_pct}%)",
@@ -1706,23 +2256,30 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
     if round_nums:
         lines.append("  🔵 Круглые: " + " / ".join(f"{r:.6g}" for r in round_nums))
 
-    # ── ZONE QUALITY SCORE ──
+    # Body-уровни в зоне
+    body_in_zone = kwargs.get("body_in_zone", [])
+    if body_in_zone:
+        for blv in body_in_zone[:2]:
+            cnt       = blv.get("count", blv.get("candle_count", "?"))
+            rejects   = blv.get("wick_rejects", 0)
+            is_cl     = blv.get("cluster", False)
+            rej_str   = f" · ↩{rejects} заколов" if rejects else ""
+            cl_str    = " · кластер" if is_cl else ""
+            lines.append(f"  🟣 Тело-уровень: <b>{blv['price']:.6g}</b> ×{cnt}св{cl_str}{rej_str}")
+
     lines.append("")
     lines.append(f"🛡 Надёжность зоны: <b>{zq_score}/10</b> — {zq_verdict}")
-    for flag in zq_flags[:4]:  # топ-4 фактора
+    for flag in zq_flags[:4]:
         lines.append(f"  {flag}")
 
-    # OI
     if oi_str:
         lines.append(f"📊 OI: {oi_str}")
         if oi_details.get("flags"):
-            for f in oi_details["flags"][1:2]:  # второй флаг если есть
+            for f in oi_details["flags"][1:2]:
                 lines.append(f"  {f}")
 
-    # Пик
     lines.append(f"🏔 Пик: {peak_desc}")
 
-    # Рекомендация по объёму
     lines.append("")
     if rec_pct == 0:
         lines.append("📌 <b>Рекомендация: НЕ ЗАХОДИТЬ</b>")
@@ -1732,7 +2289,6 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
         for lm in limits:
             lines.append(f"  <b>{lm['label']}: {lm['price']:.6g}</b>  ← {lm['reason']}")
 
-    # Сквиз
     lines.append("")
     lines.append(f"🎯 Сквиз: {squeeze_prob}")
     if sq_details["natr_squeeze"]:
@@ -1745,7 +2301,6 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
     if alert_type == "zone_broken":
         lines.append("")
         lines.append("⚠️ Нижняя граница пробита вниз на объёме")
-        # Ищем следующую поддержку ниже зоны (из переданных уровней)
         below_levels = sorted(
             [lv for lv in (broken_levels or []) if lv["price"] < zone_low * 0.999],
             key=lambda x: x["price"], reverse=True
@@ -1758,13 +2313,10 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
                 f"<b>{ns['price']:.6g}</b> [{ns['tf']}] ({dist_ns:+.1f}%) "
                 f"× {ns.get('touches', '?')} касаний · держится {ns.get('hold_mins', '?')}мин"
             )
-            # Если есть ещё уровни — добавляем вторую поддержку
             if len(below_levels) >= 2:
                 ns2 = below_levels[1]
                 dist_ns2 = round((ns2["price"] - close) / close * 100, 2)
-                lines.append(
-                    f"  Далее: <b>{ns2['price']:.6g}</b> [{ns2['tf']}] ({dist_ns2:+.1f}%)"
-                )
+                lines.append(f"  Далее: <b>{ns2['price']:.6g}</b> [{ns2['tf']}] ({dist_ns2:+.1f}%)")
         else:
             lines.append("Убирай лимитки · следующая поддержка ниже")
 
@@ -1830,6 +2382,17 @@ def inplay_scan_symbol(symbol):
     inner     = find_inner_levels(k1, k5, zone_low, zone_high)
     rounds    = find_round_numbers_in_zone(zone_low, zone_high)
 
+    # ── Body-уровни по закрытиям тел свечей ──
+    body_raw    = find_body_levels(k1, min_cluster=3, tol_pct=0.15)
+    body_clustered = cluster_body_levels(body_raw, tol_pct=0.20)
+    # Добавляем кол-во заколов к каждому уровню
+    for blv in body_clustered:
+        rej_count, _ = detect_wick_rejects(k1, blv["price"])
+        blv["wick_rejects"] = rej_count
+    # Уровни в зоне и ниже — для лимиток и графика
+    body_in_zone = [b for b in body_clustered
+                    if zone_low * 0.995 <= b["price"] <= zone_high * 1.005]
+
     # OI анализ
     oi_data              = get_open_interest(symbol)
     oi_score, oi_str, oi_details = calc_oi_signal(oi_data, pump_pct)
@@ -1840,7 +2403,8 @@ def inplay_scan_symbol(symbol):
     # Zone Quality Score
     zq_score, zq_verdict, rec_pct, zq_flags = calc_zone_quality(
         k1, k5, natr, zone_high, zone_low,
-        broken, oi_score, peak_score
+        broken, oi_score, peak_score,
+        body_in_zone=body_in_zone
     )
 
     sq_prob, sq_details = calc_squeeze_probability(k1, k5, zone_high, natr)
@@ -1857,6 +2421,8 @@ def inplay_scan_symbol(symbol):
         "zone_low":   zone_low,
         "inner":      inner,
         "rounds":     rounds,
+        "body_levels":    body_clustered,   # все body-уровни
+        "body_in_zone":   body_in_zone,     # body-уровни внутри зоны
         "sq_prob":    sq_prob,
         "sq_details": sq_details,
         "limits":     limits,
@@ -1915,7 +2481,8 @@ def inplay_loop(symbols_ref):
                                     prev["natr"], prev["vol_mult"],
                                     prev["oi_str"], prev["oi_details"], prev["peak_desc"],
                                     prev["zq_score"], prev["zq_verdict"], prev["rec_pct"], prev["zq_flags"],
-                                    alert_type="zone_broken"
+                                    alert_type="zone_broken",
+                                    body_in_zone=prev.get("body_in_zone", [])
                                 )
                                 k1_broken = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                                                   {"symbol": sym, "interval": "1m", "limit": 80})
@@ -1923,7 +2490,9 @@ def inplay_loop(symbols_ref):
                                     sym, k1_broken or [],
                                     prev["zone_low"], prev["zone_high"],
                                     prev.get("inner",[]), prev.get("rounds",[]),
-                                    prev.get("limits",[]), prev.get("broken",[])
+                                    prev.get("limits",[]), prev.get("broken",[]),
+                                    body_levels=prev.get("body_levels",[]),
+                                    alert_type="zone_broken"
                                 ) if k1_broken else None
                                 if chart_broken:
                                     send_photo(chart_broken, msg)
@@ -1950,12 +2519,15 @@ def inplay_loop(symbols_ref):
                             data["natr"], data["vol_mult"],
                             data["oi_str"], data["oi_details"], data["peak_desc"],
                             data["zq_score"], data["zq_verdict"], data["rec_pct"], data["zq_flags"],
-                            alert_type="inplay"
+                            alert_type="inplay",
+                            body_in_zone=data.get("body_in_zone", [])
                         )
                         chart = build_inplay_chart(
                             sym, data["k1"], zone_low, zone_high,
                             data["inner"], data["rounds"], data["limits"],
-                            data["broken"]
+                            data["broken"],
+                            body_levels=data.get("body_levels", []),
+                            alert_type="inplay"
                         )
                         if chart: send_photo(chart, caption)
                         else:     send_message(caption)
@@ -1984,12 +2556,15 @@ def inplay_loop(symbols_ref):
                                 data["natr"], data["vol_mult"],
                                 data["oi_str"], data["oi_details"], data["peak_desc"],
                                 data["zq_score"], data["zq_verdict"], data["rec_pct"], data["zq_flags"],
-                                alert_type="zone_update"
+                                alert_type="zone_update",
+                                body_in_zone=data.get("body_in_zone", [])
                             )
                             chart = build_inplay_chart(
                                 sym, data["k1"], zone_low, zone_high,
                                 data["inner"], data["rounds"], data["limits"],
-                                data["broken"]
+                                data["broken"],
+                                body_levels=data.get("body_levels", []),
+                                alert_type="zone_update"
                             )
                             if chart: send_photo(chart, caption)
                             else:     send_message(caption)
@@ -2009,12 +2584,15 @@ def inplay_loop(symbols_ref):
                             data["natr"], data["vol_mult"],
                             data["oi_str"], data["oi_details"], data["peak_desc"],
                             data["zq_score"], data["zq_verdict"], data["rec_pct"], data["zq_flags"],
-                            alert_type="approach"
+                            alert_type="approach",
+                            body_in_zone=data.get("body_in_zone", [])
                         )
                         chart = build_inplay_chart(
                             sym, data["k1"], zone_low, zone_high,
                             data["inner"], data["rounds"], data["limits"],
-                            data["broken"]
+                            data["broken"],
+                            body_levels=data.get("body_levels", []),
+                            alert_type="approach"
                         )
                         if chart: send_photo(chart, caption)
                         else:     send_message(caption)
@@ -2121,15 +2699,29 @@ def detect_pseudo_pump(symbol, k1, k5):
     avg_vol_post = sum(vols_1m[-20:]) / 20 if len(vols_1m) >= 20 else 1
     green_with_vol = sum(
         1 for c in post_peak
-        if float(c[4]) >= float(c[1])                        # зелёная
-        and float(c[7]) > avg_vol_post * 0.5                 # объём > 50% среднего
+        if float(c[4]) >= float(c[1])
+        and float(c[7]) > avg_vol_post * 0.5
     )
     crit4_no_buyers = green_with_vol == 0 and len(post_peak) >= 3
 
-    # ── Итоговый скор (0–4) ──
-    score = sum([crit1_vol, crit2_speed, crit3_oi, crit4_no_buyers])
+    # ── Критерий 5: Стакан после пика — биды убирают, аски стоят ──
+    depth = fetch(f"{BINANCE_BASE}/fapi/v1/depth",
+                  {"symbol": symbol, "limit": 20})
+    crit5_orderbook = False
+    ob_ratio = 0.5
+    if depth:
+        bid_vol = sum(float(b[1]) for b in depth.get("bids", []))
+        ask_vol = sum(float(a[1]) for a in depth.get("asks", []))
+        total_ob = bid_vol + ask_vol
+        if total_ob > 0:
+            ob_ratio = bid_vol / total_ob
+            # Стакан перекошен в продажи: биды < 35% от суммарного объёма
+            crit5_orderbook = ob_ratio < 0.35
 
-    # Псевдопамп если выполнены минимум 3 из 4 критериев
+    # ── Итоговый скор (0–5) ──
+    score = sum([crit1_vol, crit2_speed, crit3_oi, crit4_no_buyers, crit5_orderbook])
+
+    # Псевдопамп если выполнены минимум 3 из 5 критериев
     is_pseudo = score >= 3
 
     # ── Уровень флэта ДО пампа (pre-pump support) ──
@@ -2148,25 +2740,35 @@ def detect_pseudo_pump(symbol, k1, k5):
     retest_high = peak_high + atr * 0.5
     retest_low  = peak_high - atr * 0.5
 
+    # ── Временна́я метка пика для ленты сделок ──
+    peak_ts_ms = int(k1[peak_idx][0])
+    pump_start_ts_ms = int(k1[pump_start_idx][0])
+
     details = {
-        "is_pseudo":       is_pseudo,
-        "score":           score,
-        "pump_pct":        round(pump_pct, 1),
-        "pump_mins":       pump_duration_mins,
-        "pump_speed_15":   round(pump_speed_per_15, 1),
-        "vol_ratio":       round(vol_ratio * 100, 1),   # в %
-        "oi_change":       round(oi_change, 1),
-        "green_with_vol":  green_with_vol,
-        "crit_vol":        crit1_vol,
-        "crit_speed":      crit2_speed,
-        "crit_oi":         crit3_oi,
-        "crit_no_buyers":  crit4_no_buyers,
-        "peak_high":       peak_high,
-        "pre_pump_low":    round(pre_pump_low, 8),
-        "pre_pump_high":   round(pre_pump_high, 8),
-        "retest_high":     round(retest_high, 8),
-        "retest_low":      round(retest_low, 8),
-        "close_now":       close_now,
+        "is_pseudo":         is_pseudo,
+        "score":             score,
+        "pump_pct":          round(pump_pct, 1),
+        "pump_mins":         pump_duration_mins,
+        "pump_speed_15":     round(pump_speed_per_15, 1),
+        "vol_ratio":         round(vol_ratio * 100, 1),
+        "oi_change":         round(oi_change, 1),
+        "green_with_vol":    green_with_vol,
+        "ob_ratio":          round(ob_ratio, 3),
+        "crit_vol":          crit1_vol,
+        "crit_speed":        crit2_speed,
+        "crit_oi":           crit3_oi,
+        "crit_no_buyers":    crit4_no_buyers,
+        "crit_orderbook":    crit5_orderbook,
+        "peak_high":         peak_high,
+        "peak_idx":          peak_idx,
+        "peak_ts_ms":        peak_ts_ms,
+        "pump_start_ts_ms":  pump_start_ts_ms,
+        "pre_pump_low":      round(pre_pump_low, 8),
+        "pre_pump_high":     round(pre_pump_high, 8),
+        "retest_high":       round(retest_high, 8),
+        "retest_low":        round(retest_low, 8),
+        "close_now":         close_now,
+        "natr":              round(calc_natr(k1), 3),
     }
     return is_pseudo, score, details
 
@@ -2175,21 +2777,15 @@ def build_pseudo_alert(symbol, d):
     """Строит Telegram-сообщение для псевдопампа."""
     coin = symbol.replace("USDT", "")
     p    = d["peak_high"]
-    natr_stop_buf = abs(d["retest_high"] - p) * 0.3  # буфер для стопа
+    div  = make_divider("pseudo")
 
-    # Стоп для шорта на ретесте — чуть выше хая
-    short_stop = round(p * 1.005, 8)
-
-    # Стоп для лонга у pre-pump — чуть ниже уровня
-    long_stop  = round(d["pre_pump_low"] * 0.993, 8)
-
-    # Цель шорта — pre-pump уровень
+    short_stop   = round(p * 1.005, 8)
+    long_stop    = round(d["pre_pump_low"] * 0.993, 8)
     short_target = round((d["pre_pump_low"] + d["pre_pump_high"]) / 2, 8)
+    long_target  = round(d["pre_pump_high"] * 1.04, 8)
 
-    # Цель лонга — +4%
-    long_target = round(d["pre_pump_high"] * 1.04, 8)
+    rr = round(abs(d["peak_high"] - short_target) / max(abs(short_stop - d["peak_high"]), 1e-10), 0)
 
-    # Признаки
     crits = []
     if d["crit_vol"]:
         crits.append(f"📉 Объём до пампа: {d['vol_ratio']:.1f}% от пампового (тихий флэт)")
@@ -2200,22 +2796,24 @@ def build_pseudo_alert(symbol, d):
         crits.append(f"🔄 OI изменился только на {d['oi_change']:.1f}% — не новые позиции")
     if d["crit_no_buyers"]:
         crits.append("🚫 После хая — ноль покупателей, только красные свечи")
+    if d.get("crit_orderbook"):
+        crits.append(f"📖 Стакан: биды {round(d.get('ob_ratio',0)*100)}% — биды убирают")
 
     lines = [
-        f"⚠️ ПСЕВДОПАМП · <code>{symbol}</code>",
-        "━━━━━━━━━━━━━━━━━━━",
+        make_header("pseudo", symbol, f"ПСЕВДОПАМП · {d['score']}/5 крит"),
+        div,
         f"Памп +{d['pump_pct']:.0f}% за {d['pump_mins']}мин — признаки управляемого движения",
-        f"Совпавших критериев: <b>{d['score']}/4</b>",
         "",
         "🔍 Признаки:",
     ] + crits + [
         "",
-        f"📍 Pre-pump уровень (откуда начинали): <b>{d['pre_pump_low']:.6g} – {d['pre_pump_high']:.6g}</b>",
+        div,
+        f"📍 Pre-pump уровень: <b>{d['pre_pump_low']:.6g} – {d['pre_pump_high']:.6g}</b>",
         f"📍 Хай пампа: <b>{d['peak_high']:.6g}</b>",
         "",
         f"📉 <b>Шорт-зона (ретест хая):</b> {d['retest_low']:.6g} – {d['retest_high']:.6g}",
         f"   Цель: {short_target:.6g}  ·  Стоп: выше {short_stop:.6g}",
-        f"   R/R ≈ 1:{round(abs(d['peak_high'] - short_target) / abs(short_stop - d['peak_high']), 0):.0f}",
+        f"   R/R ≈ 1:{rr:.0f}",
         "",
         f"📈 <b>Лонг-зона (у старта):</b> {d['pre_pump_low']:.6g} – {d['pre_pump_high']:.6g}",
         f"   Цель: {long_target:.6g}  ·  Стоп: ниже {long_stop:.6g}",
@@ -2268,10 +2866,10 @@ def build_pseudo_chart(symbol, k1, d):
                     label=f"Лонг-зона {d['pre_pump_low']:.6g}–{d['pre_pump_high']:.6g}", zorder=6)
         ax1.axhline(y=d["pre_pump_low"],  color="#26a69a", lw=1.2, ls="--", zorder=6)
 
-        # Заголовок с признаками
+        # Заголовок синим цветом (стиль псевдопамп = 🔵)
         crit_str = f"{d['score']}/4 крит · +{d['pump_pct']:.0f}% за {d['pump_mins']}мин"
-        ax1.set_title(f"⚠️ {symbol} · ПСЕВДОПАМП · {crit_str}",
-                      color="#ff8800", fontsize=12, fontweight="bold", pad=8)
+        ax1.set_title(f"🔵 {symbol} · ПСЕВДОПАМП · {crit_str}",
+                      color=CHART_TITLE_COLOR["pseudo"], fontsize=12, fontweight="bold", pad=8)
 
         ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_usd(x)))
         ticks = list(range(0, n, max(1, n // 6)))
@@ -2334,12 +2932,268 @@ def detect_pseudo_dump_start(k1, peak_idx):
             lower_highs = 0  # сбрасываем серию
 
     return vol_declining and lower_highs >= 2
-    now = time.time()
-    key = f"pseudo_{symbol}"
-    if now - pseudo_alert_cache.get(key, 0) >= cooldown:
-        pseudo_alert_cache[key] = now
-        return True
-    return False
+
+
+def get_trade_flow(symbol, start_ts_ms, end_ts_ms, limit=500):
+    """
+    Анализирует ленту сделок за период пампа.
+    Возвращает dict:
+      buyer_vol   — объём маркет-байев ($)
+      seller_vol  — объём маркет-селлов ($)
+      big_buy_cnt — крупных маркет-байев (qty > медианы × 3)
+      big_sell_cnt
+      flow_ratio  — buyer_vol / (buyer_vol + seller_vol), 0..1
+      is_fake     — True если крупных байев не было (псевдо-подтверждение)
+    """
+    trades = fetch(
+        f"{BINANCE_BASE}/fapi/v1/aggTrades",
+        {"symbol": symbol, "startTime": int(start_ts_ms),
+         "endTime": int(end_ts_ms), "limit": limit}
+    )
+    if not trades:
+        return {"is_fake": None, "flow_ratio": 0.5,
+                "buyer_vol": 0, "seller_vol": 0,
+                "big_buy_cnt": 0, "big_sell_cnt": 0}
+
+    qtys = [float(t["q"]) for t in trades]
+    median_qty = sorted(qtys)[len(qtys) // 2] if qtys else 1
+    BIG = median_qty * 3
+
+    buyer_vol    = seller_vol    = 0.0
+    big_buy_cnt  = big_sell_cnt  = 0
+
+    for t in trades:
+        qty    = float(t["q"])
+        price  = float(t["p"])
+        usd    = qty * price
+        is_buy = not t["m"]          # m=True → продавец инициатор (makerSide=sell)
+        if is_buy:
+            buyer_vol   += usd
+            if qty >= BIG: big_buy_cnt  += 1
+        else:
+            seller_vol  += usd
+            if qty >= BIG: big_sell_cnt += 1
+
+    total = buyer_vol + seller_vol
+    flow_ratio = buyer_vol / total if total > 0 else 0.5
+    # Псевдопамп = крупных маркет-байев не было при наличии продаж
+    is_fake = (big_buy_cnt == 0 and big_sell_cnt >= 1 and flow_ratio < 0.45)
+
+    return {
+        "buyer_vol":    round(buyer_vol),
+        "seller_vol":   round(seller_vol),
+        "big_buy_cnt":  big_buy_cnt,
+        "big_sell_cnt": big_sell_cnt,
+        "flow_ratio":   round(flow_ratio, 3),
+        "is_fake":      is_fake,
+    }
+
+
+def calc_short_entry(k1, peak_idx, atr, d):
+    """
+    Определяет оптимальный момент и цену входа в шорт.
+
+    Условия (все три обязательны):
+      1. Цена закрылась ниже VWAP периода пампа
+      2. Объём текущей свечи < 30% от пикового
+      3. Close текущей свечи < Close предыдущей (нисходящий импульс)
+
+    Возвращает dict с entry, stop, target, rr и reason — или None.
+    """
+    if peak_idx is None or peak_idx >= len(k1) - 2:
+        return None
+
+    # VWAP за период пампа (от pump_start до сейчас)
+    pump_window = k1[max(0, peak_idx - 5):]
+    vwap_pump   = calc_vwap(pump_window)
+    vwap_now    = vwap_pump[-1] if vwap_pump else None
+    if not vwap_now:
+        return None
+
+    peak_vol  = float(k1[peak_idx][7])
+    cur       = k1[-1]
+    prev      = k1[-2]
+    cur_close = float(cur[4])
+    cur_vol   = float(cur[7])
+    prev_close= float(prev[4])
+
+    below_vwap     = cur_close < vwap_now
+    vol_declining  = cur_vol   < peak_vol * 0.30
+    bearish_close  = cur_close < prev_close
+
+    if not (below_vwap and vol_declining and bearish_close):
+        return None
+
+    # Параметры сделки
+    entry  = cur_close
+    stop   = round(d["peak_high"] * 1.005, 8)          # стоп выше хая + 0.5%
+    target = round((d["pre_pump_low"] + d["pre_pump_high"]) / 2, 8)
+    risk   = abs(stop - entry)
+    reward = abs(entry - target)
+    rr     = round(reward / risk, 1) if risk > 0 else 0
+
+    reasons = []
+    if below_vwap:    reasons.append("цена ниже VWAP пампа")
+    if vol_declining: reasons.append(f"объём {cur_vol/peak_vol*100:.0f}% от пика")
+    if bearish_close: reasons.append("медвежье закрытие")
+
+    return {
+        "entry":      entry,
+        "stop":       stop,
+        "target":     target,
+        "rr":         rr,
+        "vwap_now":   vwap_now,
+        "peak_vol":   peak_vol,
+        "cur_vol":    cur_vol,
+        "reasons":    reasons,
+    }
+
+
+def build_short_entry_chart(symbol, k1, d, entry_info):
+    """
+    График момента входа в шорт:
+    - свечи 1m
+    - VWAP пампа (оранжевый)
+    - Точка входа (красная горизонталь с меткой ВХОД)
+    - Стоп (красный пунктир)
+    - Цель (зелёный пунктир)
+    - Шорт-зона ретеста
+    """
+    try:
+        data   = k1[-80:]
+        n      = len(data)
+        opens  = [float(c[1]) for c in data]
+        highs  = [float(c[2]) for c in data]
+        lows   = [float(c[3]) for c in data]
+        closes = [float(c[4]) for c in data]
+        dvols  = [float(c[7]) for c in data]
+        times  = [datetime.utcfromtimestamp(int(c[0])/1000) for c in data]
+
+        if max(highs) == 0 or n < 5:
+            return None
+
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
+                                        gridspec_kw={"height_ratios": [3, 1]},
+                                        facecolor="#0d1117")
+        ax1.set_facecolor("#0d1117")
+        ax2.set_facecolor("#0d1117")
+        w = 0.6
+
+        for i in range(n):
+            color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
+            ax1.plot([i, i], [lows[i], highs[i]], color=color, lw=0.8)
+            bh = abs(closes[i] - opens[i]) or (highs[i] - lows[i]) * 0.01
+            ax1.add_patch(Rectangle((i - w/2, min(opens[i], closes[i])), w, bh,
+                                     facecolor=color, edgecolor=color))
+            ax2.bar(i, dvols[i], color=color, width=w, alpha=0.85)
+
+        # VWAP всего окна
+        vwap_all = calc_vwap(data)
+        ax1.plot(range(n), vwap_all, color="#ff9800", lw=1.2,
+                 ls="--", alpha=0.85, label="VWAP", zorder=6)
+
+        # Шорт-зона
+        ax1.axhspan(d["retest_low"], d["retest_high"],
+                    alpha=0.12, color="#ef5350", zorder=2)
+        ax1.axhline(y=d["peak_high"], color="#ff8800", lw=1.2, ls=":",
+                    alpha=0.8, label=f"Хай {d['peak_high']:.6g}", zorder=5)
+
+        # Точка входа
+        entry  = entry_info["entry"]
+        stop   = entry_info["stop"]
+        target = entry_info["target"]
+
+        ax1.axhline(y=entry, color="#ef5350", lw=2.0, ls="-", zorder=8,
+                    label=f"🔴 ВХОД {entry:.6g}")
+        ax1.axhline(y=stop,  color="#ff4444", lw=1.3, ls="--", zorder=7,
+                    label=f"Стоп {stop:.6g}")
+        ax1.axhline(y=target, color="#26a69a", lw=1.5, ls="-.", zorder=7,
+                    label=f"Цель {target:.6g}")
+
+        # Риск/прибыль — закрашенные зоны
+        ax1.axhspan(target, entry, alpha=0.08, color="#26a69a", zorder=3)
+        ax1.axhspan(entry,  stop,  alpha=0.08, color="#ef5350",  zorder=3)
+
+        # Подпись ВХОД с R/R
+        ax1.text(n * 0.05, entry,
+                 f"  ← ВХОД · R/R 1:{entry_info['rr']}",
+                 color="#ef5350", fontsize=9, va="bottom", fontweight="bold",
+                 bbox=dict(facecolor="#0d1117", alpha=0.7, pad=2, edgecolor="#ef5350"))
+
+        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: fmt_usd(x)))
+        ticks = list(range(0, n, max(1, n // 6)))
+        for ax in [ax1, ax2]:
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([times[i].strftime("%H:%M") for i in ticks],
+                                color="#8b949e", fontsize=8)
+            ax.tick_params(colors="#8b949e", labelsize=8)
+            ax.yaxis.set_tick_params(labelcolor="#8b949e")
+            for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
+            ax.grid(color="#21262d", ls="--", lw=0.5)
+            ax.set_xlim(-1, n)
+
+        draw_volume_profile(ax1, data)
+        ax1.legend(loc="upper left", fontsize=7, facecolor="#161b22",
+                   edgecolor="#30363d", labelcolor="white", framealpha=0.85)
+        ax1.set_title(f"🔴 {symbol} · ШОРТ-ВХОД · 1m",
+                      color=CHART_TITLE_COLOR["short_entry"],
+                      fontsize=13, fontweight="bold", pad=8)
+        ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
+        ax2.set_ylabel("Vol USD", color="#8b949e", fontsize=9)
+        plt.tight_layout(pad=1.2)
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
+        plt.close(fig)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"  [SHORT CHART ERR {symbol}] {e}")
+        return None
+
+
+def build_short_entry_alert(symbol, d, entry_info, flow=None):
+    """
+    Строит сообщение алерта 'Шорт открывается'.
+    Цвет: 🔴 (тот же красный что у SPLASH и zone_broken — агрессивный сигнал).
+    """
+    coin   = symbol.replace("USDT", "")
+    div    = make_divider("short_entry")
+    header = make_header("short_entry", symbol, "ШОРТ ОТКРЫВАЕТСЯ")
+
+    flow_line = ""
+    if flow and flow.get("is_fake") is not None:
+        if flow["is_fake"]:
+            buyer_pct = round(flow["flow_ratio"] * 100)
+            flow_line = (f"📊 Лента: байеров {buyer_pct}% · "
+                         f"крупных маркет-байев: {flow['big_buy_cnt']} — "
+                         f"<b>памп без реальных покупателей ✅</b>\n")
+        else:
+            buyer_pct = round(flow["flow_ratio"] * 100)
+            flow_line = (f"📊 Лента: байеров {buyer_pct}% · "
+                         f"крупных байев: {flow['big_buy_cnt']} — "
+                         f"⚠️ есть реальный спрос\n")
+
+    reasons_str = " · ".join(entry_info["reasons"]) if entry_info["reasons"] else "—"
+    vol_pct     = round(entry_info["cur_vol"] / entry_info["peak_vol"] * 100)
+
+    lines = [
+        header,
+        div,
+        f"Вход: <b>{entry_info['entry']:.6g}</b>",
+        f"Стоп: <b>{entry_info['stop']:.6g}</b>  (выше хая пампа + 0.5%)",
+        f"Цель: <b>{entry_info['target']:.6g}</b>  (середина pre-pump зоны)",
+        f"R/R:  <b>1:{entry_info['rr']}</b>",
+        div,
+        f"Условия входа: {reasons_str}",
+        f"Объём сейчас: {vol_pct}% от пикового",
+        flow_line,
+        div,
+        f"⚡ Памп: +{d['pump_pct']:.0f}% за {d['pump_mins']}мин · "
+        f"Хай: {d['peak_high']:.6g}",
+        f"📉 Pre-pump зона: {d['pre_pump_low']:.6g}–{d['pre_pump_high']:.6g}",
+        f"💎 <code>{coin}</code>",
+    ]
+    return "\n".join(l for l in lines if l is not None)
 
 
 def pseudo_scan_symbol(symbol):
@@ -2452,7 +3306,50 @@ def pseudo_loop(symbols_ref):
                                          "_db_event_id": d.get("_db_event_id")
                                                          or (prev or {}).get("_db_event_id")}
 
-                # ── ФИНАЛЬНЫЙ АЛЕРТ: цена вернулась к pre-pump зоне ──
+                # ── ШОРТ-ВХОД: условия входа выполнены ──
+                # Срабатывает ТОЛЬКО пока цена ещё наверху (не вернулась к pre-pump)
+                # и только если был ранний алерт по этому событию
+                short_key   = f"pseudo_short_{sym}"
+                already_fired = pseudo_alert_cache.get(short_key, 0)
+                peak_idx_d  = d.get("peak_idx")
+                above_prepump = close_now > d["pre_pump_high"] * 1.01
+
+                if (above_prepump
+                        and peak_idx_d is not None
+                        and not already_fired
+                        and k1_early is not None):
+                    atr_d       = d.get("natr", 1.0) * d["peak_high"] / 100
+                    entry_info  = calc_short_entry(k1_early, peak_idx_d, atr_d, d)
+                    if entry_info and entry_info["rr"] >= 2.0:
+                        # Получаем данные ленты сделок
+                        flow = None
+                        try:
+                            flow = get_trade_flow(
+                                sym,
+                                d.get("pump_start_ts_ms", d["peak_ts_ms"] - 600000),
+                                d["peak_ts_ms"]
+                            )
+                        except Exception as _fe:
+                            print(f"  [FLOW ERR {sym}] {_fe}")
+
+                        # Пропускаем если лента показывает реальный спрос
+                        if flow and flow.get("is_fake") is False and flow["big_buy_cnt"] >= 3:
+                            print(f"  [PSEUDO] ⚠️ {sym} лента: реальные байеры, шорт пропущен")
+                        else:
+                            pseudo_alert_cache[short_key] = time.time()
+                            msg_short = build_short_entry_alert(sym, d, entry_info, flow)
+                            k1_short  = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                                              {"symbol": sym, "interval": "1m", "limit": 120})
+                            chart_short = build_short_entry_chart(sym, k1_short or k1_early,
+                                                                   d, entry_info)
+                            if chart_short:
+                                send_photo(chart_short, msg_short)
+                            else:
+                                send_message(msg_short)
+                            print(f"  [PSEUDO] 🔴 {sym} ШОРТ-ВХОД"
+                                  f" entry={entry_info['entry']:.6g}"
+                                  f" stop={entry_info['stop']:.6g}"
+                                  f" R/R=1:{entry_info['rr']}")
                 # Это итоговое сообщение — шлём ОДИН раз, без повторов
                 at_prepump = d["pre_pump_low"] * 0.995 <= close_now <= d["pre_pump_high"] * 1.005
 
@@ -2467,13 +3364,13 @@ def pseudo_loop(symbols_ref):
                         since_peak = round((now_t - (prev or d).get("since", now_t)) / 60)
 
                         msg = (
-                            f"📉 <code>{sym}</code> · ПСЕВДОПАМП — цена вернулась к старту\n"
-                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"{make_header('pseudo', sym, 'ПСЕВДОПАМП — цена вернулась к старту')}\n"
+                            f"{make_divider('pseudo')}\n"
                             f"Хай пампа: <b>{d['peak_high']:.6g}</b>\n"
                             f"Pre-pump зона: <b>{d['pre_pump_low']:.6g} – {d['pre_pump_high']:.6g}</b>\n"
                             f"Текущая цена: <b>{close_now:.6g}</b>\n"
                             f"Время от хая: <b>~{since_peak}мин</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"{make_divider('pseudo')}\n"
                             f"✅ Шорт отработан · ждём продолжения или выхода\n"
                             f"💎 <code>{sym.replace('USDT', '')}</code>"
                         )
@@ -2508,11 +3405,13 @@ def pseudo_loop(symbols_ref):
                     if now_t - pseudo_alert_cache.get(key, 0) >= 600:
                         pseudo_alert_cache[key] = now_t
                         msg_r = (
-                            f"🎯 <code>{sym}</code> · РЕТЕСТ ХАЯ ПСЕВДОПАМПА\n"
+                            f"{make_header('zone', sym, 'РЕТЕСТ ХАЯ ПСЕВДОПАМПА')}\n"
+                            f"{make_divider('zone')}\n"
                             f"Шорт-зона: <b>{d['retest_low']:.6g}–{d['retest_high']:.6g}</b>\n"
                             f"Цель: {d['pre_pump_low']:.6g} · "
                             f"Стоп: {round(d['peak_high'] * 1.005, 8):.6g}\n"
-                            f"⚠️ Зона для входа в шорт"
+                            f"⚠️ Зона для входа в шорт\n"
+                            f"💎 <code>{sym.replace('USDT', '')}</code>"
                         )
                         k1_rt = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                                       {"symbol": sym, "interval": "1m", "limit": 120})
@@ -2625,8 +3524,8 @@ def build_splash_chart(symbol, k1):
             ax.set_xlim(-1, n)
 
         draw_volume_profile(ax1, data)
-        ax1.set_title(f"💥 {symbol} · SPLASH · 1m",
-                      color="#ff6600", fontsize=13, fontweight="bold", pad=8)
+        ax1.set_title(f"🔴 {symbol} · SPLASH · 1m",
+                      color=CHART_TITLE_COLOR["splash"], fontsize=13, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
         ax2.set_ylabel("Vol USD", color="#8b949e", fontsize=9)
         plt.tight_layout(pad=1.2)
@@ -2704,13 +3603,12 @@ def splash_loop(symbols_ref):
                 vol_str   = fmt_usd(result["vol_usd"])
 
                 caption = (
-                    f"{direction} <code>{sym}</code> · SPLASH\n"
-                    f"━━━━━━━━━━━━━━━━━━━\n"
-                    f"Тикер: <b>{sym}</b>\n"
+                    f"{make_header('splash', sym, 'SPLASH')}\n"
+                    f"{make_divider('splash')}\n"
                     f"Изменение: <b>{chg:+.2f}%</b> за {SPLASH_WINDOW_MIN} мин\n"
                     f"Объём ({SPLASH_WINDOW_MIN} мин): <b>{vol_str}</b>\n"
                     f"Цена: <b>{result['price_close']:.6g}</b>\n"
-                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"{make_divider('splash')}\n"
                     f"{'⚡ Резкий рост — возможен инплей' if chg > 0 else '⚠️ Резкое падение — следи за поддержкой'}\n"
                     f"💎 <code>{coin}</code>"
                 )
@@ -3019,7 +3917,8 @@ def _send_result_alert(sig, k1=None):
                 })
             chart = build_inplay_chart(
                 symbol, k1, zone_low, zone_high,
-                [], [], [], levels_for_chart
+                [], [], [], levels_for_chart,
+                body_levels=[], alert_type="inplay"
             )
         except Exception as e:
             print(f"  [RESULT CHART ERR] {e}")
@@ -3191,7 +4090,8 @@ def send_daily_stats_with_charts(recent):
                                              "type": "sup", "tf": "1m"})
                 try:
                     chart = build_inplay_chart(symbol, k1_snap, zone_low, zone_high,
-                                               [], [], [], levels_for_chart)
+                                               [], [], [], levels_for_chart,
+                                               body_levels=[], alert_type="inplay")
                 except Exception:
                     chart = build_chart(symbol, k1_snap, levels_for_chart)
 
@@ -3334,8 +4234,8 @@ def build_deviation_chart(symbol, k1, mark, index):
 
         # Volume Profile
         draw_volume_profile(ax1, data)
-        ax1.set_title(f"{symbol} · Расхождение Mark/Index",
-                      color="#e6edf3", fontsize=12, fontweight="bold", pad=8)
+        ax1.set_title(f"🟡 {symbol} · Расхождение Mark/Index",
+                      color=CHART_TITLE_COLOR["deviation"], fontsize=12, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
         ax2.set_ylabel("Vol USD", color="#8b949e", fontsize=9)
         plt.tight_layout(pad=1.2)
@@ -3388,14 +4288,13 @@ def deviation_scan_loop(symbols_ref):
                     fund_str = f"⚪ {fund*100:.4f}% (нейтральный)"
 
                 caption = (
-                    f"📊 <code>{sym}</code> · расхождение цены\n"
-                    f"━━━━━━━━━━━━━━━━━━━\n"
-                    f"Тикер: <b>{sym}</b>\n"
+                    f"{make_header('deviation', sym, f'расхождение · {abs(dev_pct):.2f}%')}\n"
+                    f"{make_divider('deviation')}\n"
                     f"Отклонение: <b>{abs(dev_pct):.2f}%</b> ({direction} индекса)\n"
                     f"Цена Index: <b>{index:.6g}</b>\n"
                     f"Цена Mark: <b>{mark:.6g}</b>\n"
                     f"Фандинг: {fund_str}\n"
-                    f"━━━━━━━━━━━━━━━━━━━\n"
+                    f"{make_divider('deviation')}\n"
                     f"{'⚠️ Цена выше индекса — риск коррекции к индексу' if dev_pct > 0 else '⚠️ Цена ниже индекса — возможен отскок к индексу'}\n"
                     f"💎 <code>{coin}</code>"
                 )
@@ -3474,7 +4373,8 @@ def build_inplay_digest_chart(symbol, k1):
             ax.set_xlim(-1, n)
         # Volume Profile
         draw_volume_profile(ax1, data, n_bins=30, alpha=0.2)
-        ax1.set_title(f"{symbol} · 1m", color="#e6edf3",
+        ax1.set_title(f"🟢 {symbol} · ДАЙДЖЕСТ · 1m",
+                      color=CHART_TITLE_COLOR["inplay"],
                       fontsize=10, fontweight="bold", pad=6)
         plt.tight_layout(pad=1.0)
         buf = io.BytesIO()
