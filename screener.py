@@ -97,6 +97,150 @@ splash_alert_cache: dict = {}
 DEVIATION_THRESHOLD_NEW = 2.9  # % (показываем только от 2.9%)
 
 # ─────────────────────────────────────────────
+#  РЫНОЧНЫЙ КОНТЕКСТ (BTC/ETH)
+# ─────────────────────────────────────────────
+
+# Глобальный кэш контекста — обновляется каждые 2 мин
+_market_ctx: dict = {
+    "btc_change_5m":  0.0,
+    "eth_change_5m":  0.0,
+    "btc_change_15m": 0.0,
+    "correlated":     False,   # True = рынок движется вместе (BTC ≥ ±1.5%)
+    "ts":             0,
+}
+_market_ctx_lock = threading.Lock()
+
+# Коэффициент ужесточения порогов при коррелированном движении рынка
+MARKET_CORR_MULTIPLIER = 1.5   # SPLASH_CHANGE_PCT × 1.5, PSEUDO_PUMP_SPEED × 1.5
+MARKET_CORR_THRESHOLD  = 1.5   # % BTC за 5 мин — считаем коррелированным
+
+
+def get_market_context() -> dict:
+    """Возвращает текущий рыночный контекст (из кэша)."""
+    with _market_ctx_lock:
+        return dict(_market_ctx)
+
+
+def _fetch_change_pct(symbol: str, window_min: int) -> float:
+    """Изменение цены символа за последние window_min минут."""
+    k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+               {"symbol": symbol, "interval": "1m", "limit": window_min + 2})
+    if not k1 or len(k1) < window_min + 1:
+        return 0.0
+    price_open  = float(k1[-(window_min + 1)][1])
+    price_close = float(k1[-1][4])
+    if price_open <= 0:
+        return 0.0
+    return (price_close - price_open) / price_open * 100
+
+
+def market_context_loop():
+    """
+    Каждые 2 минуты обновляет _market_ctx:
+      - btc_change_5m, eth_change_5m, btc_change_15m
+      - correlated = True если |btc_change_5m| >= MARKET_CORR_THRESHOLD
+    При коррелированном рынке SPLASH и PSEUDO порог умножается на MARKET_CORR_MULTIPLIER.
+    """
+    global _market_ctx
+    print("  [CTX] Монитор рыночного контекста запущен")
+    while True:
+        try:
+            btc_5m  = _fetch_change_pct("BTCUSDT",  5)
+            eth_5m  = _fetch_change_pct("ETHUSDT",  5)
+            btc_15m = _fetch_change_pct("BTCUSDT", 15)
+            corr    = abs(btc_5m) >= MARKET_CORR_THRESHOLD
+
+            with _market_ctx_lock:
+                _market_ctx = {
+                    "btc_change_5m":  round(btc_5m, 3),
+                    "eth_change_5m":  round(eth_5m, 3),
+                    "btc_change_15m": round(btc_15m, 3),
+                    "correlated":     corr,
+                    "ts":             time.time(),
+                }
+            if corr:
+                print(f"  [CTX] ⚡ BTC {btc_5m:+.2f}% за 5м — рынок коррелирован,"
+                      f" порог × {MARKET_CORR_MULTIPLIER}")
+        except Exception as e:
+            print(f"  [CTX ERR] {e}")
+        time.sleep(120)
+
+
+def effective_splash_threshold() -> float:
+    """
+    Возвращает актуальный порог SPLASH с учётом контекста рынка.
+    При коррелированном рынке порог увеличивается чтобы не алертить
+    на движения вместе с BTC.
+    """
+    ctx = get_market_context()
+    if ctx["correlated"]:
+        return SPLASH_CHANGE_PCT * MARKET_CORR_MULTIPLIER
+    return SPLASH_CHANGE_PCT
+
+
+def effective_pseudo_speed() -> float:
+    """PSEUDO_PUMP_SPEED с поправкой на рыночный контекст."""
+    ctx = get_market_context()
+    if ctx["correlated"]:
+        return PSEUDO_PUMP_SPEED * MARKET_CORR_MULTIPLIER
+    return PSEUDO_PUMP_SPEED
+
+
+# ─────────────────────────────────────────────
+#  ЛИКВИДАЦИИ (фильтр для псевдопампов)
+# ─────────────────────────────────────────────
+
+LIQ_PSEUDO_MAX_USD = 50_000    # ликвидаций шортов < $50k → псевдопамп
+LIQ_REAL_MIN_USD   = 150_000   # ликвидаций шортов > $150k → реальный шорткрыл
+
+
+def get_liquidations(symbol: str, start_ts_ms: int, end_ts_ms: int) -> dict:
+    """
+    Получает ликвидации по символу за период.
+    /fapi/v1/forceOrders — публичный endpoint (не требует API-ключа).
+
+    Возвращает:
+      short_liq_usd — сумма ликвидаций шортов ($)
+      long_liq_usd  — сумма ликвидаций лонгов ($)
+      is_fake       — True если шорт-ликвидаций мало (псевдопамп, не шорткрыл)
+      is_squeeze    — True если шорт-ликвидаций много (реальный шортокрыл)
+    """
+    try:
+        data = fetch(
+            f"{BINANCE_BASE}/fapi/v1/forceOrders",
+            {"symbol": symbol, "startTime": start_ts_ms,
+             "endTime": end_ts_ms, "limit": 100}
+        )
+    except Exception:
+        data = None
+
+    if not data:
+        return {"short_liq_usd": 0, "long_liq_usd": 0,
+                "is_fake": None, "is_squeeze": None, "count": 0}
+
+    short_usd = long_usd = 0.0
+    for order in data:
+        qty   = float(order.get("origQty", 0))
+        price = float(order.get("averagePrice", order.get("price", 0)))
+        usd   = qty * price
+        side  = order.get("side", "")     # BUY = ликвидация шорта, SELL = ликвидация лонга
+        if side == "BUY":
+            short_usd += usd
+        elif side == "SELL":
+            long_usd  += usd
+
+    is_fake    = short_usd < LIQ_PSEUDO_MAX_USD   # мало шорт-ликвидаций
+    is_squeeze = short_usd > LIQ_REAL_MIN_USD     # много — реальный шорткрыл
+
+    return {
+        "short_liq_usd": round(short_usd),
+        "long_liq_usd":  round(long_usd),
+        "is_fake":       is_fake,
+        "is_squeeze":    is_squeeze,
+        "count":         len(data),
+    }
+
+# ─────────────────────────────────────────────
 #  ГЛОБАЛЬНОЕ СОСТОЯНИЕ
 # ─────────────────────────────────────────────
 
@@ -2745,11 +2889,12 @@ def detect_pseudo_pump(symbol, k1, k5):
     vol_ratio = pre_pump_vol / pump_vol if pump_vol > 0 else 1.0
     crit1_vol = vol_ratio < PSEUDO_VOL_RATIO
 
-    # ── Критерий 2: Скорость пампа ──
+    # ── Критерий 2: Скорость пампа (с поправкой на рыночный контекст) ──
     pump_duration_mins = max(1, peak_idx - pump_start_idx)
     pump_pct = (peak_high - float(k1[pump_start_idx][3])) / float(k1[pump_start_idx][3]) * 100
-    pump_speed_per_15 = (pump_pct / pump_duration_mins) * 15  # нормализуем к 15мин
-    crit2_speed = pump_speed_per_15 > PSEUDO_PUMP_SPEED
+    pump_speed_per_15 = (pump_pct / pump_duration_mins) * 15
+    speed_threshold   = effective_pseudo_speed()   # растёт если BTC тоже движется
+    crit2_speed = pump_speed_per_15 > speed_threshold
 
     # ── Критерий 3: OI почти не менялся ──
     oi_data   = get_open_interest(symbol)
@@ -2782,14 +2927,31 @@ def detect_pseudo_pump(symbol, k1, k5):
         total_ob = bid_vol + ask_vol
         if total_ob > 0:
             ob_ratio = bid_vol / total_ob
-            # Стакан перекошен в продажи: биды < 35% от суммарного объёма
             crit5_orderbook = ob_ratio < 0.35
 
-    # ── Итоговый скор (0–5) ──
-    score = sum([crit1_vol, crit2_speed, crit3_oi, crit4_no_buyers, crit5_orderbook])
+    # ── Критерий 6: Ликвидации шортов малые (не шорткрыл) ──
+    peak_ts_ms       = int(k1[peak_idx][0])
+    pump_start_ts_ms = int(k1[pump_start_idx][0])
+    liq = get_liquidations(symbol, pump_start_ts_ms, peak_ts_ms + 60_000)
+    crit6_low_liq = False
+    liq_str       = ""
+    if liq["is_fake"] is not None:
+        crit6_low_liq = liq["is_fake"]      # мало шорт-ликвидаций → псевдопамп
+        short_k = liq["short_liq_usd"] / 1000
+        liq_str = f"{short_k:.0f}k"
+    elif liq["is_squeeze"] is True:
+        crit6_low_liq = False                # реальный шорткрыл — не псевдопамп
 
-    # Псевдопамп если выполнены минимум 3 из 5 критериев
+    # ── Итоговый скор (0–6) ──
+    score = sum([crit1_vol, crit2_speed, crit3_oi,
+                 crit4_no_buyers, crit5_orderbook, crit6_low_liq])
+
+    # Псевдопамп если выполнены минимум 3 из 6 критериев
     is_pseudo = score >= 3
+
+    # При реальном шорткрыле (ликвидаций > $150k) — не псевдопамп
+    if liq.get("is_squeeze"):
+        is_pseudo = False
 
     # ── Уровень флэта ДО пампа (pre-pump support) ──
     pre_pump_window = k1[max(0, pump_start_idx - 30): pump_start_idx + 1]
@@ -2807,10 +2969,6 @@ def detect_pseudo_pump(symbol, k1, k5):
     retest_high = peak_high + atr * 0.5
     retest_low  = peak_high - atr * 0.5
 
-    # ── Временна́я метка пика для ленты сделок ──
-    peak_ts_ms = int(k1[peak_idx][0])
-    pump_start_ts_ms = int(k1[pump_start_idx][0])
-
     details = {
         "is_pseudo":         is_pseudo,
         "score":             score,
@@ -2826,6 +2984,10 @@ def detect_pseudo_pump(symbol, k1, k5):
         "crit_oi":           crit3_oi,
         "crit_no_buyers":    crit4_no_buyers,
         "crit_orderbook":    crit5_orderbook,
+        "crit_low_liq":      crit6_low_liq,
+        "liq_short_usd":     liq.get("short_liq_usd", 0),
+        "liq_is_squeeze":    liq.get("is_squeeze", None),
+        "liq_str":           liq_str,
         "peak_high":         peak_high,
         "peak_idx":          peak_idx,
         "peak_ts_ms":        peak_ts_ms,
@@ -2836,6 +2998,8 @@ def detect_pseudo_pump(symbol, k1, k5):
         "retest_low":        round(retest_low, 8),
         "close_now":         close_now,
         "natr":              round(calc_natr(k1), 3),
+        "market_corr":       get_market_context()["correlated"],
+        "speed_threshold":   round(speed_threshold, 1),
     }
     return is_pseudo, score, details
 
@@ -2865,11 +3029,19 @@ def build_pseudo_alert(symbol, d):
         crits.append("🚫 После хая — ноль покупателей, только красные свечи")
     if d.get("crit_orderbook"):
         crits.append(f"📖 Стакан: биды {round(d.get('ob_ratio',0)*100)}% — биды убирают")
+    if d.get("crit_low_liq"):
+        liq_s = d.get("liq_str", "0k")
+        crits.append(f"💧 Ликвидаций шортов: ${liq_s} — не шорткрыл, управляемый памп")
+
+    # Строка контекста рынка
+    ctx_line = ""
+    if d.get("market_corr"):
+        ctx_line = f"⚠️ BTC коррелирует · порог скорости повышен до {d.get('speed_threshold', PSEUDO_PUMP_SPEED)}%/15м\n"
 
     lines = [
-        make_header("pseudo", symbol, f"ПСЕВДОПАМП · {d['score']}/5 крит"),
+        make_header("pseudo", symbol, f"ПСЕВДОПАМП · {d['score']}/6 крит"),
         div,
-        f"Памп +{d['pump_pct']:.0f}% за {d['pump_mins']}мин — признаки управляемого движения",
+        ctx_line + f"Памп +{d['pump_pct']:.0f}% за {d['pump_mins']}мин — признаки управляемого движения",
         "",
         "🔍 Признаки:",
     ] + crits + [
@@ -3608,8 +3780,8 @@ def build_splash_chart(symbol, k1):
 
 def scan_splash(symbol):
     """
-    Проверяет символ на SPLASH: изменение >= SPLASH_CHANGE_PCT за последние
-    SPLASH_WINDOW_MIN минут (1m-свечи). Возвращает dict с деталями или None.
+    Проверяет символ на SPLASH. Порог изменения зависит от рыночного контекста:
+    если BTC движется ±1.5%+ за 5 мин — порог ужесточается × MARKET_CORR_MULTIPLIER.
     """
     k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                {"symbol": symbol, "interval": "1m", "limit": SPLASH_WINDOW_MIN + 5})
@@ -3617,18 +3789,27 @@ def scan_splash(symbol):
         return None
 
     window      = k1[-(SPLASH_WINDOW_MIN + 1):]
-    price_open  = float(window[0][1])    # open первой свечи окна
-    price_close = float(window[-1][4])   # close последней (текущей)
+    price_open  = float(window[0][1])
+    price_close = float(window[-1][4])
 
     if price_open <= 0:
         return None
 
     change_pct = (price_close - price_open) / price_open * 100
 
-    if abs(change_pct) < SPLASH_CHANGE_PCT:
+    # Порог с учётом контекста рынка
+    threshold = effective_splash_threshold()
+    if abs(change_pct) < threshold:
         return None
 
-    # Объём за окно (USD)
+    # BTC движется в том же направлении — это корреляция, не SPLASH
+    ctx = get_market_context()
+    if ctx["correlated"]:
+        btc_dir   = 1 if ctx["btc_change_5m"] > 0 else -1
+        coin_dir  = 1 if change_pct > 0 else -1
+        if btc_dir == coin_dir and abs(change_pct) < threshold:
+            return None   # движение скоррелировано с BTC, уже отфильтровано выше
+
     vol_window = sum(float(c[7]) for c in window[1:])
     if vol_window < SPLASH_MIN_VOL_USD:
         return None
@@ -3639,6 +3820,8 @@ def scan_splash(symbol):
         "price_close": price_close,
         "vol_usd":     vol_window,
         "k1":          k1,
+        "threshold":   round(threshold, 2),   # для отладки
+        "correlated":  ctx["correlated"],
     }
 
 
@@ -3669,6 +3852,11 @@ def splash_loop(symbols_ref):
                 coin      = sym.replace("USDT", "")
                 vol_str   = fmt_usd(result["vol_usd"])
 
+                ctx       = get_market_context()
+                ctx_note  = (f"⚠️ BTC {ctx['btc_change_5m']:+.2f}% за 5м · "
+                             f"порог повышен до {result['threshold']}%\n"
+                             if ctx["correlated"] else "")
+
                 caption = (
                     f"{make_header('splash', sym, 'SPLASH')}\n"
                     f"{make_divider('splash')}\n"
@@ -3676,6 +3864,7 @@ def splash_loop(symbols_ref):
                     f"Объём ({SPLASH_WINDOW_MIN} мин): <b>{vol_str}</b>\n"
                     f"Цена: <b>{result['price_close']:.6g}</b>\n"
                     f"{make_divider('splash')}\n"
+                    f"{ctx_note}"
                     f"{'⚡ Резкий рост — возможен инплей' if chg > 0 else '⚠️ Резкое падение — следи за поддержкой'}\n"
                     f"💎 <code>{coin}</code>"
                 )
@@ -4554,6 +4743,9 @@ def main():
     time.sleep(3)
     symbols_ref[0] = get_all_symbols()
     print(f"  [SYM] Символов загружено: {len(symbols_ref[0])}")
+
+    # Монитор рыночного контекста BTC/ETH (обновляется каждые 2 мин)
+    threading.Thread(target=market_context_loop, daemon=True).start()
 
     # Слой 2 в отдельном потоке
     threading.Thread(target=layer2_loop, daemon=True).start()
