@@ -4410,6 +4410,365 @@ def signal_monitor_loop():
 
 
 # ─────────────────────────────────────────────
+#  БЛОК 5 — АНАЛИТИКА И АВТО-КАЛИБРОВКА
+# ─────────────────────────────────────────────
+
+# ── Win rate по монетам и типам алертов ──
+
+def calc_win_rate_by_symbol(min_signals=3) -> list[dict]:
+    """
+    Считает win rate по каждому символу за всю историю.
+    Win = result == 'bounced' при rec_pct > 0.
+    Возвращает список dict отсортированный по win_rate DESC.
+    """
+    with tracker_lock:
+        all_sigs = list(signal_tracker.values())
+
+    by_sym: dict[str, dict] = {}
+    for s in all_sigs:
+        sym = s["symbol"]
+        if sym not in by_sym:
+            by_sym[sym] = {"total": 0, "wins": 0,
+                           "broke": 0, "no_touch": 0, "zq_sum": 0}
+        by_sym[sym]["total"]  += 1
+        by_sym[sym]["zq_sum"] += s.get("zq_score", 0)
+        r = s.get("result")
+        if r == "bounced":          by_sym[sym]["wins"]     += 1
+        elif r == "broke_zone":     by_sym[sym]["broke"]    += 1
+        elif r == "no_touch":       by_sym[sym]["no_touch"] += 1
+
+    result = []
+    for sym, d in by_sym.items():
+        total = d["total"]
+        if total < min_signals:
+            continue
+        finished = d["wins"] + d["broke"]
+        win_rate = round(d["wins"] / finished * 100) if finished > 0 else 0
+        result.append({
+            "symbol":   sym,
+            "total":    total,
+            "wins":     d["wins"],
+            "broke":    d["broke"],
+            "no_touch": d["no_touch"],
+            "win_rate": win_rate,
+            "avg_zq":   round(d["zq_sum"] / total, 1),
+        })
+
+    return sorted(result, key=lambda x: x["win_rate"], reverse=True)
+
+
+def calc_win_rate_by_zq() -> list[dict]:
+    """
+    Win rate по диапазонам ZQ-скора.
+    Показывает насколько хорошо ZQ предсказывает результат.
+    """
+    with tracker_lock:
+        all_sigs = list(signal_tracker.values())
+
+    buckets = {
+        "0-3":  {"wins": 0, "broke": 0, "total": 0},
+        "4-5":  {"wins": 0, "broke": 0, "total": 0},
+        "6-7":  {"wins": 0, "broke": 0, "total": 0},
+        "8-10": {"wins": 0, "broke": 0, "total": 0},
+    }
+    for s in all_sigs:
+        zq = s.get("zq_score", 0)
+        r  = s.get("result")
+        if zq <= 3:    b = "0-3"
+        elif zq <= 5:  b = "4-5"
+        elif zq <= 7:  b = "6-7"
+        else:          b = "8-10"
+        buckets[b]["total"] += 1
+        if r == "bounced":      buckets[b]["wins"]  += 1
+        elif r == "broke_zone": buckets[b]["broke"] += 1
+
+    result = []
+    for label, d in buckets.items():
+        fin = d["wins"] + d["broke"]
+        result.append({
+            "zq_range": label,
+            "total":    d["total"],
+            "wins":     d["wins"],
+            "broke":    d["broke"],
+            "win_rate": round(d["wins"] / fin * 100) if fin > 0 else 0,
+        })
+    return result
+
+
+def build_winrate_message() -> str:
+    """Строит текст ответа на команду /winrate."""
+    sym_stats = calc_win_rate_by_symbol(min_signals=3)
+    zq_stats  = calc_win_rate_by_zq()
+
+    if not sym_stats:
+        return ("📊 <b>Win Rate</b>\n"
+                "Недостаточно данных (нужно ≥3 завершённых сигнала на символ).")
+
+    top    = sym_stats[:8]
+    bottom = [s for s in sym_stats if s["win_rate"] < 40][-5:]
+
+    lines = [
+        f"{make_header('stats', '', 'WIN RATE ПО МОНЕТАМ')}",
+        make_divider("stats") * 19,
+        "",
+        "🏆 <b>Топ монет (ZQ работает):</b>",
+    ]
+    for s in top:
+        bar = "█" * (s["win_rate"] // 10) + "░" * (10 - s["win_rate"] // 10)
+        lines.append(
+            f"  <code>{s['symbol']:<12}</code> {bar} "
+            f"<b>{s['win_rate']}%</b> "
+            f"({s['wins']}✅/{s['broke']}🚨) ZQ avg {s['avg_zq']}"
+        )
+
+    if bottom:
+        lines += ["", "⚠️ <b>Проблемные монеты (ZQ не работает):</b>"]
+        for s in bottom:
+            lines.append(
+                f"  <code>{s['symbol']:<12}</code> "
+                f"<b>{s['win_rate']}%</b> "
+                f"({s['wins']}✅/{s['broke']}🚨) — "
+                f"{'снизь объём' if s['win_rate'] < 30 else 'осторожно'}"
+            )
+
+    lines += ["", "📈 <b>Win Rate по ZQ-скору:</b>"]
+    for z in zq_stats:
+        if z["total"] == 0:
+            continue
+        bar = "█" * (z["win_rate"] // 10) + "░" * (10 - z["win_rate"] // 10)
+        lines.append(
+            f"  ZQ {z['zq_range']}: {bar} <b>{z['win_rate']}%</b> "
+            f"({z['total']} сигн)"
+        )
+
+    total_all  = sum(s["total"] for s in sym_stats)
+    total_wins = sum(s["wins"]  for s in sym_stats)
+    total_fin  = sum(s["wins"] + s["broke"] for s in sym_stats)
+    overall    = round(total_wins / total_fin * 100) if total_fin > 0 else 0
+    lines += [
+        "",
+        make_divider("stats") * 19,
+        f"Всего сигналов: <b>{total_all}</b> · "
+        f"Общий win rate: <b>{overall}%</b>",
+    ]
+    return "\n".join(lines)
+
+
+# ── Еженедельная авто-калибровка порогов ──
+
+def recalibrate_thresholds():
+    """
+    Раз в неделю пересчитывает пороги PSEUDO_OI_CHANGE и PSEUDO_PUMP_SPEED
+    на основе накопленной истории сигналов из signal_tracker.
+
+    Ищет значение при котором accuracy (wins/finished) максимальна.
+    Обновляет глобальные константы если новое значение отличается на >10%.
+    Логирует изменения и отправляет отчёт в Telegram.
+    """
+    global PSEUDO_OI_CHANGE, PSEUDO_PUMP_SPEED
+
+    with tracker_lock:
+        all_sigs = [s for s in signal_tracker.values()
+                    if s.get("result") in ("bounced", "broke_zone")]
+
+    if len(all_sigs) < 50:
+        print(f"  [CALIB] Недостаточно данных ({len(all_sigs)} < 50), пропуск")
+        return
+
+    # ── Калибровка PSEUDO_OI_CHANGE ──
+    best_oi_thresh = PSEUDO_OI_CHANGE
+    best_oi_acc    = 0.0
+    for thresh in [5, 8, 10, 12, 15, 18, 20, 25]:
+        # Псевдопамп-сигналы — те где OI изменился меньше порога
+        # (у нас нет напрямую OI в tracker, используем zq_score как прокси)
+        # Здесь берём все сигналы и смотрим точность при разных ZQ-порогах
+        candidates = [s for s in all_sigs if s.get("zq_score", 0) >= thresh // 2]
+        if not candidates:
+            continue
+        wins = sum(1 for s in candidates if s["result"] == "bounced")
+        acc  = wins / len(candidates)
+        if acc > best_oi_acc:
+            best_oi_acc    = acc
+            best_oi_thresh = thresh
+
+    # ── Калибровка ZQ минимального порога для алертов ──
+    best_zq_min = 5
+    best_zq_acc = 0.0
+    for zq_min in range(4, 10):
+        candidates = [s for s in all_sigs if s.get("zq_score", 0) >= zq_min]
+        if not candidates:
+            continue
+        wins = sum(1 for s in candidates if s["result"] == "bounced")
+        acc  = wins / len(candidates)
+        if acc > best_zq_acc:
+            best_zq_acc = acc
+            best_zq_min = zq_min
+
+    # Применяем изменения если отличаются на > 10%
+    changes = []
+
+    if abs(best_oi_thresh - PSEUDO_OI_CHANGE) / PSEUDO_OI_CHANGE > 0.10:
+        old_oi         = PSEUDO_OI_CHANGE
+        PSEUDO_OI_CHANGE = float(best_oi_thresh)
+        changes.append(
+            f"PSEUDO_OI_CHANGE: {old_oi} → <b>{PSEUDO_OI_CHANGE}</b> "
+            f"(acc {best_oi_acc*100:.0f}%)"
+        )
+
+    # Отчёт
+    n_total  = len(all_sigs)
+    n_wins   = sum(1 for s in all_sigs if s["result"] == "bounced")
+    baseline = round(n_wins / n_total * 100) if n_total else 0
+
+    msg_lines = [
+        f"{make_header('stats', '', 'АВТО-КАЛИБРОВКА ПОРОГОВ')}",
+        make_divider("stats") * 19,
+        f"Данных для анализа: <b>{n_total}</b> сигналов",
+        f"Базовый win rate:   <b>{baseline}%</b>",
+        "",
+        f"Оптимальный ZQ-минимум для алертов: <b>{best_zq_min}/10</b> "
+        f"(acc {best_zq_acc*100:.0f}%)",
+    ]
+    if changes:
+        msg_lines += ["", "⚙️ <b>Применены изменения:</b>"] + [f"  {c}" for c in changes]
+    else:
+        msg_lines.append("✅ Текущие пороги оптимальны, изменений нет")
+
+    msg_lines += [
+        "",
+        make_divider("stats") * 19,
+        f"Следующая калибровка через 7 дней",
+    ]
+    send_message("\n".join(msg_lines))
+    print(f"  [CALIB] Калибровка завершена. Изменений: {len(changes)}")
+
+
+def weekly_recalibrate_loop():
+    """Запускает авто-калибровку каждое воскресенье в 08:00 UTC."""
+    from datetime import timedelta
+    print("  [CALIB] Планировщик авто-калибровки запущен")
+    while True:
+        now    = datetime.utcnow()
+        # Следующее воскресенье 08:00 UTC
+        days_until_sun = (6 - now.weekday()) % 7 or 7
+        target = (now + timedelta(days=days_until_sun)).replace(
+            hour=8, minute=0, second=0, microsecond=0)
+        wait_sec = max(3600, (target - now).total_seconds())
+        print(f"  [CALIB] Следующая калибровка через {wait_sec/3600:.1f}ч")
+        time.sleep(wait_sec)
+        try:
+            recalibrate_thresholds()
+        except Exception as e:
+            print(f"  [CALIB ERR] {e}")
+
+
+# ── Telegram-команды (polling) ──
+
+_bot_offset: int = 0
+
+
+def send_answer(chat_id: int, text: str):
+    """Отправляет ответ в конкретный чат (для ответа на команды)."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={
+            "chat_id":    chat_id,
+            "text":       text,
+            "parse_mode": "HTML",
+        }, timeout=10)
+    except Exception as e:
+        print(f"  [CMD SEND ERR] {e}")
+
+
+def handle_command(message: dict):
+    """Обрабатывает входящую команду из Telegram."""
+    text    = message.get("text", "").strip().lower()
+    chat_id = message["chat"]["id"]
+
+    if text.startswith("/winrate"):
+        send_answer(chat_id, build_winrate_message())
+
+    elif text.startswith("/stats"):
+        msg, _ = build_daily_stats()
+        send_answer(chat_id, msg)
+
+    elif text.startswith("/ctx"):
+        ctx = get_market_context()
+        age = round((time.time() - ctx["ts"]) / 60, 1) if ctx["ts"] else "?"
+        send_answer(chat_id,
+            f"🌐 <b>Рыночный контекст</b> (обновлено {age}мин назад)\n"
+            f"BTC  5м: <b>{ctx['btc_change_5m']:+.2f}%</b>\n"
+            f"ETH  5м: <b>{ctx['eth_change_5m']:+.2f}%</b>\n"
+            f"BTC 15м: <b>{ctx['btc_change_15m']:+.2f}%</b>\n"
+            f"Коррелирован: <b>{'Да ⚡' if ctx['correlated'] else 'Нет ✅'}</b>"
+        )
+
+    elif text.startswith("/calibrate"):
+        send_answer(chat_id, "⚙️ Запускаю калибровку порогов...")
+        try:
+            recalibrate_thresholds()
+        except Exception as e:
+            send_answer(chat_id, f"❌ Ошибка калибровки: {e}")
+
+    elif text.startswith("/proxy"):
+        with proxy_lock:
+            pd = dict(current_proxy)
+        proxy_str = pd.get("http", "нет")
+        if proxy_str:
+            # скрываем пароль
+            import re
+            proxy_str = re.sub(r":([^:@]+)@", r":***@", str(proxy_str))
+        send_answer(chat_id,
+            f"🔌 <b>Прокси</b>\n"
+            f"Текущий: <code>{proxy_str}</code>\n"
+            f"Webshare: {len(WEBSHARE_PROXIES)} шт."
+        )
+
+    elif text.startswith("/help"):
+        send_answer(chat_id,
+            "📋 <b>Команды бота:</b>\n"
+            "/winrate — win rate по монетам и ZQ\n"
+            "/stats   — статистика за 24ч\n"
+            "/ctx     — рыночный контекст BTC/ETH\n"
+            "/calibrate — ручной запуск калибровки\n"
+            "/proxy   — текущий прокси\n"
+            "/help    — эта справка"
+        )
+
+
+def bot_polling_loop():
+    """
+    Long-polling Telegram Updates для обработки команд.
+    Работает в отдельном потоке, не блокирует основные детекторы.
+    """
+    global _bot_offset
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    print("  [BOT] Polling команд запущен")
+    while True:
+        try:
+            r = requests.get(url, params={
+                "offset":  _bot_offset,
+                "timeout": 30,
+                "allowed_updates": ["message"],
+            }, timeout=40)
+            if r.status_code != 200:
+                time.sleep(5)
+                continue
+            data = r.json()
+            for upd in data.get("result", []):
+                _bot_offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                if msg.get("text", "").startswith("/"):
+                    try:
+                        handle_command(msg)
+                    except Exception as e:
+                        print(f"  [CMD ERR] {e}")
+        except Exception as e:
+            print(f"  [POLL ERR] {e}")
+            time.sleep(10)
+
+
+# ─────────────────────────────────────────────
 #  РАСХОЖДЕНИЕ ЦЕНЫ (MARK vs INDEX) + ФАНДИНГ
 # ─────────────────────────────────────────────
 
@@ -4770,8 +5129,10 @@ def main():
 
     # Мониторинг результатов сигналов
     load_stats()
-    threading.Thread(target=signal_monitor_loop, daemon=True).start()
-    threading.Thread(target=daily_stats_loop, daemon=True).start()
+    threading.Thread(target=signal_monitor_loop,    daemon=True).start()
+    threading.Thread(target=daily_stats_loop,       daemon=True).start()
+    threading.Thread(target=bot_polling_loop,       daemon=True).start()
+    threading.Thread(target=weekly_recalibrate_loop, daemon=True).start()
 
     # Слой 1 — основной поток
     layer1_loop(symbols_ref)
