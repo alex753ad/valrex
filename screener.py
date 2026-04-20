@@ -6,6 +6,7 @@ Crypto Screener v4 — 3-слойная архитектура
 """
 
 import os
+import json
 import requests
 import time
 import threading
@@ -68,7 +69,7 @@ INPLAY_PUMP_MINS    = 30       # окно поиска лоя
 INPLAY_NATR_MIN     = 1.0      # минимальный NATR для инплей
 INPLAY_VOL_MULT     = 3.0      # минимальный спайк объёма
 INPLAY_SCAN_SEC     = 20       # интервал сканирования инплей
-INPLAY_TTL          = 3600     # 1 час монета в инплей-наблюдении
+INPLAY_TTL          = 7200     # FIX S3-1: 2 часа вместо 1 (монеты дольше в наблюдении)
 INPLAY_HOLD_CANDLES = 1        # мин закрытых 5m свечей выше уровня
 ZONE_APPROACH_PCT   = 2.0      # % от верхней границы зоны → алерт "идёт к зоне"
 ORDER_BOOK_DEPTH    = 20
@@ -258,29 +259,29 @@ alert_lock   = threading.Lock()
 inplay_coins: dict = {}
 inplay_lock   = threading.Lock()
 inplay_alert_cache: dict = {}
+# FIX S1-1: единый lock для inplay_alert_cache — защищает от race condition
+# при одновременной работе 20+ потоков ThreadPoolExecutor
+_inplay_alert_lock = threading.Lock()
 
 # Псевдопамп
 pseudo_coins: dict = {}
 pseudo_lock   = threading.Lock()
 pseudo_alert_cache: dict = {}
+# FIX S1-1: единый lock для pseudo_alert_cache
+_pseudo_alert_lock = threading.Lock()
 
 proxy_lock   = threading.Lock()
 current_proxy = {"http": None, "https": None}
 PROXY_LIST: list = []
 
-# ── Платные Webshare-прокси (формат ip:port:user:pass) ──
-WEBSHARE_PROXIES = [
-    "31.59.20.176:6754:yjpyqacj:4qhho7l230x1",
-    "198.23.239.134:6540:yjpyqacj:4qhho7l230x1",
-    "45.38.107.97:6014:yjpyqacj:4qhho7l230x1",
-    "107.172.163.27:6543:yjpyqacj:4qhho7l230x1",
-    "198.105.121.200:6462:yjpyqacj:4qhho7l230x1",
-    "216.10.27.159:6837:yjpyqacj:4qhho7l230x1",
-    "142.111.67.146:5611:yjpyqacj:4qhho7l230x1",
-    "191.96.254.138:6185:yjpyqacj:4qhho7l230x1",
-    "31.58.9.4:6077:yjpyqacj:4qhho7l230x1",
-    "23.26.71.145:5628:yjpyqacj:4qhho7l230x1",
-]
+# ── Платные Webshare-прокси (FIX S1-4: credentials теперь из env-переменной) ──
+# В Railway добавь переменную окружения WEBSHARE_PROXIES в формате:
+# ip1:port1:user1:pass1,ip2:port2:user2:pass2,...
+# Пример: 31.59.20.176:6754:myuser:mypass,198.23.239.134:6540:myuser:mypass
+_ws_raw = os.environ.get("WEBSHARE_PROXIES", "")
+WEBSHARE_PROXIES: list[str] = [p.strip() for p in _ws_raw.split(",") if p.strip()]
+if not WEBSHARE_PROXIES:
+    print("  [PROXY] ⚠️ WEBSHARE_PROXIES не задан в env — работаю без Webshare")
 
 http_session = requests.Session()
 http_session.headers.update({"User-Agent": "CryptoScreener/4.0"})
@@ -397,7 +398,10 @@ def proxy_watchdog_loop():
 #  HTTP
 # ─────────────────────────────────────────────
 
-def fetch(url, params=None, timeout=8):
+def fetch(url, params=None, timeout=5):
+    # FIX S4-3: timeout снижен с 8с до 5с для klines/depth-запросов.
+    # При 300 символах × 20 workers зависший запрос 8с тормозил всю волну сканирования.
+    # Для send_photo/send_message timeout остаётся 20с (задаётся явно в тех функциях).
     with proxy_lock:
         proxy = dict(current_proxy)
     try:
@@ -728,6 +732,9 @@ def draw_volume_profile(ax, candles, n_bins=40, alpha=0.25, poc_color="#ffd700")
 
 def build_chart(symbol, candles, levels=None, alert_type="inplay"):
     """Универсальный график 1m. alert_type задаёт цвет заголовка."""
+    # FIX S1-5: fig объявлен заранее и закрывается в finally —
+    # утечка памяти matplotlib при исключении во время отрисовки устранена
+    fig = None
     try:
         if not candles or len(candles) < 5:
             print(f"  [CHART] {symbol}: недостаточно свечей ({len(candles) if candles else 0})")
@@ -830,13 +837,16 @@ def build_chart(symbol, candles, levels=None, alert_type="inplay"):
         plt.tight_layout(pad=1.2)
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
-        plt.close(fig); buf.seek(0)
+        buf.seek(0)
         return buf.read()
     except Exception as e:
         print(f"  [CHART ERR {symbol}] {e}")
         return None
-
-def send_photo(image_bytes, caption):
+    finally:
+        # FIX S1-5: гарантированное закрытие figure предотвращает утечку памяти
+        # при исключении в процессе отрисовки (OOM на Railway за несколько часов)
+        if fig is not None:
+            plt.close(fig)
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
         r = requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID,
@@ -2131,6 +2141,8 @@ def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
                        round_nums, limits, broken_levels,
                        body_levels=None, alert_type="inplay"):
     """График с зоной, уровнями, лимитками и body-уровнями."""
+    # FIX S1-5: объявляем fig заранее для finally-закрытия
+    fig = None
     try:
         data   = k1[-80:]
         n      = len(data)
@@ -2292,11 +2304,8 @@ def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
         plt.tight_layout(pad=1.2)
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
-        plt.close(fig); buf.seek(0)
+        buf.seek(0)
         return buf.read()
-    except Exception as e:
-        print(f"  [INPLAY CHART ERR {symbol}] {e}")
-        return None
 
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
                                         gridspec_kw={"height_ratios": [3, 1]},
@@ -2407,11 +2416,15 @@ def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
         plt.tight_layout(pad=1.2)
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
-        plt.close(fig); buf.seek(0)
+        buf.seek(0)
         return buf.read()
     except Exception as e:
         print(f"  [INPLAY CHART ERR {symbol}] {e}")
         return None
+    finally:
+        # FIX S1-5: гарантированное закрытие figure — предотвращает утечку памяти
+        if fig is not None:
+            plt.close(fig)
 
 
 def build_inplay_alert(symbol, close, pump_pct, pump_mins,
@@ -2651,11 +2664,15 @@ def inplay_scan_symbol(symbol):
 
 
 def can_inplay_alert(symbol, alert_type, cooldown=120):
-    now = time.time()
+    # FIX S1-1: добавлен _inplay_alert_lock — предотвращает race condition
+    # когда несколько потоков ThreadPoolExecutor одновременно проходят проверку
+    # и оба отправляют одинаковый алерт
     key = f"{symbol}_{alert_type}"
-    if now - inplay_alert_cache.get(key, 0) >= cooldown:
-        inplay_alert_cache[key] = now
-        return True
+    with _inplay_alert_lock:
+        now = time.time()
+        if now - inplay_alert_cache.get(key, 0) >= cooldown:
+            inplay_alert_cache[key] = now
+            return True
     return False
 
 
@@ -2684,35 +2701,45 @@ def inplay_loop(symbols_ref):
                         if k1_q:
                             cur = float(k1_q[-1][4])
                             if cur < prev["zone_low"] * 0.998:  # пробой нижней границы
-                                msg = build_inplay_alert(
-                                    sym, cur, prev["pump_pct"], prev["pump_mins"],
-                                    prev["zone_low"], prev["zone_high"],
-                                    prev["broken"], prev["inner"], prev["rounds"],
-                                    prev["limits"], prev["sq_prob"], prev["sq_details"],
-                                    prev["natr"], prev["vol_mult"],
-                                    prev["oi_str"], prev["oi_details"], prev["peak_desc"],
-                                    prev["zq_score"], prev["zq_verdict"], prev["rec_pct"], prev["zq_flags"],
-                                    alert_type="zone_broken",
-                                    body_in_zone=prev.get("body_in_zone", [])
-                                )
-                                k1_broken = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                                                  {"symbol": sym, "interval": "1m", "limit": 80})
-                                chart_broken = build_inplay_chart(
-                                    sym, k1_broken or [],
-                                    prev["zone_low"], prev["zone_high"],
-                                    prev.get("inner",[]), prev.get("rounds",[]),
-                                    prev.get("limits",[]), prev.get("broken",[]),
-                                    body_levels=prev.get("body_levels",[]),
-                                    alert_type="zone_broken"
-                                ) if k1_broken else None
-                                if chart_broken:
-                                    send_photo(chart_broken, msg)
+                                # FIX S5-5: не алертим "зона пробита" если монета в псевдопампе —
+                                # снижение цены там ожидаемо (шорт отрабатывается)
+                                with pseudo_lock:
+                                    is_pseudo_sym = sym in pseudo_coins
+                                if is_pseudo_sym:
+                                    print(f"  [IP] ⏭ {sym} зона пробита — подавлено (монета в pseudo)")
+                                    with inplay_lock:
+                                        if sym in inplay_coins:
+                                            inplay_coins[sym]["zone_broken_alerted"] = True
                                 else:
-                                    send_message(msg)
-                                print(f"  [IP] 🚨 {sym} зона пробита")
-                                with inplay_lock:
-                                    if sym in inplay_coins:
-                                        inplay_coins[sym]["zone_broken_alerted"] = True
+                                    msg = build_inplay_alert(
+                                        sym, cur, prev["pump_pct"], prev["pump_mins"],
+                                        prev["zone_low"], prev["zone_high"],
+                                        prev["broken"], prev["inner"], prev["rounds"],
+                                        prev["limits"], prev["sq_prob"], prev["sq_details"],
+                                        prev["natr"], prev["vol_mult"],
+                                        prev["oi_str"], prev["oi_details"], prev["peak_desc"],
+                                        prev["zq_score"], prev["zq_verdict"], prev["rec_pct"], prev["zq_flags"],
+                                        alert_type="zone_broken",
+                                        body_in_zone=prev.get("body_in_zone", [])
+                                    )
+                                    k1_broken = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                                                      {"symbol": sym, "interval": "1m", "limit": 80})
+                                    chart_broken = build_inplay_chart(
+                                        sym, k1_broken or [],
+                                        prev["zone_low"], prev["zone_high"],
+                                        prev.get("inner",[]), prev.get("rounds",[]),
+                                        prev.get("limits",[]), prev.get("broken",[]),
+                                        body_levels=prev.get("body_levels",[]),
+                                        alert_type="zone_broken"
+                                    ) if k1_broken else None
+                                    if chart_broken:
+                                        send_photo(chart_broken, msg)
+                                    else:
+                                        send_message(msg)
+                                    print(f"  [IP] 🚨 {sym} зона пробита")
+                                    with inplay_lock:
+                                        if sym in inplay_coins:
+                                            inplay_coins[sym]["zone_broken_alerted"] = True
                     return
 
                 close     = data["close"]
@@ -2756,9 +2783,16 @@ def inplay_loop(symbols_ref):
 
                 else:
                     # Алерт 2: зона обновилась (новый пробой)
-                    if (abs(zone_high - prev["zone_high"]) / prev["zone_high"] * 100 > 0.3 or
-                        abs(zone_low  - prev["zone_low"])  / prev["zone_low"]  * 100 > 0.3):
-                        if can_inplay_alert(sym, "zone_update", cooldown=120):
+                    # FIX S2-2: кулдаун zone_update повышен до 600с (было 120с)
+                    # FIX S2-3: порог сдвига зоны масштабируется с NATR (не фиксированные 0.3%)
+                    #           при WILD NATR=4.38% порог 0.3% — это шум одной свечи;
+                    #           теперь порог = max(0.3, natr * 0.25) → при NATR 4% = 1.0%
+                    current_natr = data.get("natr", 1.0)
+                    zone_shift_threshold = max(0.3, current_natr * 0.25)
+                    ZONE_UPDATE_COOLDOWN = 600  # 10 минут
+                    if (abs(zone_high - prev["zone_high"]) / prev["zone_high"] * 100 > zone_shift_threshold or
+                        abs(zone_low  - prev["zone_low"])  / prev["zone_low"]  * 100 > zone_shift_threshold):
+                        if can_inplay_alert(sym, "zone_update", cooldown=ZONE_UPDATE_COOLDOWN):
                             caption = build_inplay_alert(
                                 sym, close, data["pump_pct"], data["pump_mins"],
                                 zone_low, zone_high, data["broken"],
@@ -2779,14 +2813,18 @@ def inplay_loop(symbols_ref):
                             )
                             if chart: send_photo(chart, caption)
                             else:     send_message(caption)
-                            print(f"  [IP] 🔄 {sym} зона обновлена")
+                            print(f"  [IP] 🔄 {sym} зона обновлена (сдвиг >{zone_shift_threshold:.1f}%)")
 
                     # Алерт 3: цена идёт к зоне
+                    # FIX S2-4: approach не отправляется если zone_update был < 5 минут назад
                     dist_to_zone = (close - zone_high) / zone_high * 100
                     now = time.time()
                     last_approach = prev.get("last_approach_alert", 0)
+                    last_zone_update = inplay_alert_cache.get(f"{sym}_zone_update", 0)
+                    approach_blocked_by_update = (now - last_zone_update) < 300  # 5 минут
                     if (0 < dist_to_zone <= ZONE_APPROACH_PCT and
-                            now - last_approach > 180):
+                            now - last_approach > 180 and
+                            not approach_blocked_by_update):  # FIX S2-4
                         caption = build_inplay_alert(
                             sym, close, data["pump_pct"], data["pump_mins"],
                             zone_low, zone_high, data["broken"],
@@ -2810,21 +2848,48 @@ def inplay_loop(symbols_ref):
                         print(f"  [IP] ⚡ {sym} идёт к зоне dist={dist_to_zone:.1f}%")
 
                     with inplay_lock:
+                        # FIX S1-3: zone_broken_alerted сохраняется из prev, а не сбрасывается!
+                        # Раньше при каждом zone_update флаг сбрасывался в False →
+                        # модуль мог повторно слать "зона пробита" по уже пробитой зоне
                         inplay_coins[sym] = {**data, "since": prev.get("since", time.time()),
-                                             "zone_broken_alerted": False,
+                                             "zone_broken_alerted": prev.get("zone_broken_alerted", False),
                                              "last_approach_alert": now if 0 < dist_to_zone <= ZONE_APPROACH_PCT else last_approach}
 
             except Exception as e:
                 print(f"  [IP ERR {sym}] {e}")
 
         # Убираем протухшие
+        # FIX S3-1: TTL увеличен до 7200с (2 часа вместо 1) — монеты дольше остаются в наблюдении
+        # FIX S3-2: перед удалением проверяем что цена действительно ушла ниже зоны;
+        #           если монета всё ещё торгуется выше zone_low — продлеваем на 30 минут
         now = time.time()
         with inplay_lock:
-            expired = [s for s, v in inplay_coins.items()
-                       if now - v.get("since", 0) > INPLAY_TTL]
-            for s in expired:
-                del inplay_coins[s]
-                print(f"  [IP] ⏰ {s} убран из инплей")
+            candidates = [s for s, v in inplay_coins.items()
+                          if now - v.get("since", 0) > INPLAY_TTL]
+        for s in candidates:
+            with inplay_lock:
+                state = inplay_coins.get(s)
+            if state is None:
+                continue
+            try:
+                k1_check = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                                 {"symbol": s, "interval": "1m", "limit": 3})
+                if k1_check:
+                    cur_price = float(k1_check[-1][4])
+                    zone_low_s = state.get("zone_low", 0)
+                    if zone_low_s > 0 and cur_price > zone_low_s:
+                        # Монета всё ещё активна — продлеваем на 30 минут
+                        with inplay_lock:
+                            if s in inplay_coins:
+                                inplay_coins[s]["since"] = now - INPLAY_TTL + 1800
+                        print(f"  [IP] ♻️ {s} продлён (цена {cur_price:.6g} > zone_low {zone_low_s:.6g})")
+                        continue
+            except Exception as _e:
+                print(f"  [IP TTL CHK {s}] {_e}")
+            with inplay_lock:
+                if s in inplay_coins:
+                    del inplay_coins[s]
+                    print(f"  [IP] ⏰ {s} убран из инплей (цена упала ниже зоны или нет данных)")
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
             list(pool.map(process_inplay, symbols))
@@ -2858,7 +2923,14 @@ def detect_pseudo_pump(symbol, k1, k5):
     vols_5m   = [float(c[7]) for c in k5]
 
     # ── Находим пик и момент начала пампа ──
-    peak_idx  = highs_1m.index(max(highs_1m[-60:]))  # пик за последний час
+    # FIX S1-2: list.index() всегда возвращал ПЕРВОЕ вхождение максимума.
+    # При двух одинаковых пиках алгоритм брал более старый — всё последующее
+    # (pump_duration, crit4_no_buyers, retest_zone) считалось от неверной точки.
+    # Теперь берём ПОСЛЕДНИЙ (самый свежий) максимум за последний час.
+    recent_highs = highs_1m[-60:]
+    peak_val = max(recent_highs)
+    # Ищем последнее вхождение максимума ([::-1].index даёт первое с конца)
+    peak_idx  = len(highs_1m) - 1 - highs_1m[::-1].index(peak_val)
     peak_high = highs_1m[peak_idx]
     close_now = closes_1m[-1]
 
@@ -2868,23 +2940,38 @@ def detect_pseudo_pump(symbol, k1, k5):
         return False, 0, {}  # пик только что — рано судить
 
     # ── Критерий 1: Объём до пампа vs объём во время пампа ──
-    # Ищем начало пампа — первую свечу с ростом > 1% от предыдущего лоя
-    pump_start_idx = peak_idx
-    for i in range(peak_idx, max(0, peak_idx - 20), -1):
-        if i == 0:
-            break
-        pct_chg = (float(k1[i][4]) - float(k1[i-1][4])) / float(k1[i-1][4]) * 100
-        if abs(pct_chg) < 0.5:
-            pump_start_idx = i - 1
-        else:
-            break
+    # FIX S5-1: алгоритм поиска pump_start_idx исправлен.
+    # Старый алгоритм шёл от пика назад и делал break при первом изменении ≥0.5%,
+    # что при постепенном пампе (+1.5% каждую свечу) останавливалось на первой же
+    # свече назад → pump_duration_mins = 1 → pump_speed_per_15 = накачан.
+    # Новый алгоритм: ищет минимум цены в окне до пика (до 30 свечей назад).
+    pump_start_idx = max(0, peak_idx - 30)
+    # Берём реальный минимум в pre-pump окне как точку старта
+    pre_window_lows = [float(k1[i][3]) for i in range(pump_start_idx, peak_idx + 1)]
+    if pre_window_lows:
+        local_min_offset = pre_window_lows.index(min(pre_window_lows))
+        pump_start_idx = pump_start_idx + local_min_offset
+    # Дополнительная проверка: памп должен быть хотя бы 2 минуты
+    if peak_idx - pump_start_idx < 2:
+        pump_start_idx = max(0, peak_idx - 2)
 
     # Объём ДО пампа (2 часа до старта, берём из 5m)
-    pre_pump_candles = max(1, pump_start_idx // 5)  # примерно в 5m-свечах
-    pre_pump_vol  = sum(vols_5m[max(0, len(vols_5m) - pre_pump_candles - 24):
-                                 max(0, len(vols_5m) - pre_pump_candles)]) / \
-                    max(1, min(24, pre_pump_candles))
-    pump_vol      = sum(vols_1m[pump_start_idx:peak_idx + 1]) / max(1, peak_idx - pump_start_idx + 1)
+    # FIX S5-2: синхронизация 1m и 5m по временны́м меткам вместо i//5.
+    # Раньше k5[pump_start_idx//5] не учитывало что k1 и k5 стартуют в разное время.
+    pump_start_ts = int(k1[pump_start_idx][0])  # timestamp в мс
+    # Находим соответствующую 5m свечу по timestamp
+    k5_ts = [int(c[0]) for c in k5]
+    pre_pump_5m_idx = 0
+    for i, ts in enumerate(k5_ts):
+        if ts <= pump_start_ts:
+            pre_pump_5m_idx = i
+        else:
+            break
+    # Берём 24 5m-свечи ДО пампа для среднего объёма
+    pre_start = max(0, pre_pump_5m_idx - 24)
+    pre_slice = vols_5m[pre_start: pre_pump_5m_idx] if pre_pump_5m_idx > 0 else []
+    pre_pump_vol = sum(pre_slice) / max(1, len(pre_slice)) if pre_slice else 0
+    pump_vol     = sum(vols_1m[pump_start_idx:peak_idx + 1]) / max(1, peak_idx - pump_start_idx + 1)
 
     vol_ratio = pre_pump_vol / pump_vol if pump_vol > 0 else 1.0
     crit1_vol = vol_ratio < PSEUDO_VOL_RATIO
@@ -3064,6 +3151,8 @@ def build_pseudo_alert(symbol, d):
 
 def build_pseudo_chart(symbol, k1, d):
     """График псевдопампа: свечи + зоны шорта и лонга."""
+    # FIX S1-5: объявляем fig заранее для finally-закрытия
+    fig = None
     try:
         data   = k1[-80:]
         n      = len(data)
@@ -3298,6 +3387,8 @@ def build_short_entry_chart(symbol, k1, d, entry_info):
     - Цель (зелёный пунктир)
     - Шорт-зона ретеста
     """
+    # FIX S1-5: объявляем fig заранее для finally-закрытия
+    fig = None
     try:
         data   = k1[-80:]
         n      = len(data)
@@ -3436,7 +3527,7 @@ def build_short_entry_alert(symbol, d, entry_info, flow=None):
 
 
 def pseudo_scan_symbol(symbol):
-    """Проверяет символ на псевдопамп. Возвращает (is_pseudo, details) или None."""
+    """Проверяет символ на псевдопамп. Возвращает (is_pseudo, details, k1) или None."""
     k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                {"symbol": symbol, "interval": "1m", "limit": 120})
     k5 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
@@ -3464,7 +3555,9 @@ def pseudo_scan_symbol(symbol):
     if not is_pseudo:
         return None
 
-    return details
+    # FIX S4-1: возвращаем k1 вместе с details чтобы process_pseudo не делал
+    # повторный HTTP-запрос (раньше k1 fetched дважды: здесь и в process_pseudo)
+    return details, k1
 
 
 def pseudo_loop(symbols_ref):
@@ -3485,7 +3578,9 @@ def pseudo_loop(symbols_ref):
                         pseudo_coins.pop(sym, None)
                     return
 
-                d = result
+                # FIX S4-1: pseudo_scan_symbol теперь возвращает (details, k1)
+                # Убираем повторный HTTP-запрос k1_early — переиспользуем уже загруженные данные
+                d, k1_early = result
                 with pseudo_lock:
                     prev = pseudo_coins.get(sym)
 
@@ -3493,12 +3588,13 @@ def pseudo_loop(symbols_ref):
 
                 # ── РАННИЙ АЛЕРТ: памп только что случился, началась фаза слива ──
                 # Детектируем СРАЗУ после пика — объём падает, хаи снижаются
-                k1_early = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                                 {"symbol": sym, "interval": "1m", "limit": 120})
+                # FIX S4-1: k1_early уже загружен выше, повторный fetch не нужен
                 peak_idx_early = None
                 if k1_early:
                     highs_all = [float(c[2]) for c in k1_early]
-                    peak_idx_early = highs_all.index(max(highs_all[-30:]))
+                    # FIX S1-2: берём последний максимум ([::-1].index) а не первый
+                    peak_val_e = max(highs_all[-30:])
+                    peak_idx_early = len(highs_all) - 1 - highs_all[::-1].index(peak_val_e)
 
                 early_dump = (
                     k1_early is not None
@@ -3507,24 +3603,40 @@ def pseudo_loop(symbols_ref):
                 )
 
                 # Новый псевдопамп или хай значительно изменился
+                # FIX S2-6: уникальный fingerprint по (symbol, peak_high округлённый до 4 знаков,
+                # примерное время пика). Предотвращает повторные алерты по тому же пику
+                # при каждом новом скане через 20 секунд.
+                peak_fingerprint = f"pseudo_{sym}_{round(d['peak_high'], 4)}"
+                # "Новый" = нет предыдущего ИЛИ peak изменился более чем на 1%
                 is_new = (prev is None or
                           abs(d["peak_high"] - prev.get("peak_high", 0))
                           / d["peak_high"] * 100 > 1.0)
+                # Дополнительно: не алертим если уже алертили по этому же fingerprint
+                with _pseudo_alert_lock:
+                    fingerprint_fired = pseudo_alert_cache.get(peak_fingerprint, 0) > 0
+                if fingerprint_fired:
+                    is_new = False
 
                 if is_new and early_dump:
                     # Ранний алерт — цена ещё около хая, начались первые продажи
                     alert_key = f"pseudo_{sym}"
                     now_t = time.time()
-                    if now_t - pseudo_alert_cache.get(alert_key, 0) >= 300:
-                        pseudo_alert_cache[alert_key] = now_t
-
+                    # FIX S1-1: используем _pseudo_alert_lock для атомарной проверки+записи
+                    _can_fire = False  # инициализация до lock-блока
+                    with _pseudo_alert_lock:
+                        _last_pseudo = pseudo_alert_cache.get(alert_key, 0)
+                        _can_fire = (now_t - _last_pseudo >= 300)
+                        if _can_fire:
+                            pseudo_alert_cache[alert_key] = now_t
+                            pseudo_alert_cache[peak_fingerprint] = now_t  # FIX S2-6: отмечаем fingerprint
+                    if _can_fire:
                         caption = build_pseudo_alert(sym, d)
                         chart   = build_pseudo_chart(sym, k1_early, d) if k1_early else None
                         if chart:
                             send_photo(chart, caption)
                         else:
                             send_message(caption)
-                        print(f"  [PSEUDO] ⚠️ {sym} РАННИЙ СИГНАЛ {d['score']}/4"
+                        print(f"  [PSEUDO] ⚠️ {sym} РАННИЙ СИГНАЛ {d['score']}/6"
                               f" +{d['pump_pct']}% peak={d['peak_high']:.6g}")
 
                         # Сохраняем первый скрин в PostgreSQL
@@ -3549,7 +3661,9 @@ def pseudo_loop(symbols_ref):
                 # Срабатывает ТОЛЬКО пока цена ещё наверху (не вернулась к pre-pump)
                 # и только если был ранний алерт по этому событию
                 short_key   = f"pseudo_short_{sym}"
-                already_fired = pseudo_alert_cache.get(short_key, 0)
+                # FIX S1-1: читаем под lock для консистентности
+                with _pseudo_alert_lock:
+                    already_fired = pseudo_alert_cache.get(short_key, 0)
                 peak_idx_d  = d.get("peak_idx")
                 above_prepump = close_now > d["pre_pump_high"] * 1.01
 
@@ -3575,7 +3689,8 @@ def pseudo_loop(symbols_ref):
                         if flow and flow.get("is_fake") is False and flow["big_buy_cnt"] >= 3:
                             print(f"  [PSEUDO] ⚠️ {sym} лента: реальные байеры, шорт пропущен")
                         else:
-                            pseudo_alert_cache[short_key] = time.time()
+                            with _pseudo_alert_lock:
+                                pseudo_alert_cache[short_key] = time.time()
                             msg_short = build_short_entry_alert(sym, d, entry_info, flow)
                             k1_short  = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                                               {"symbol": sym, "interval": "1m", "limit": 120})
@@ -3596,9 +3711,13 @@ def pseudo_loop(symbols_ref):
                     final_key = f"pseudo_final_{sym}"
                     now_t = time.time()
                     # Кулдаун 1 час — больше не спамим по этому событию
-                    if now_t - pseudo_alert_cache.get(final_key, 0) >= 3600:
-                        pseudo_alert_cache[final_key] = now_t
-
+                    # FIX S1-1: используем _pseudo_alert_lock
+                    with _pseudo_alert_lock:
+                        _final_last = pseudo_alert_cache.get(final_key, 0)
+                        _can_final = (now_t - _final_last >= 3600)
+                        if _can_final:
+                            pseudo_alert_cache[final_key] = now_t
+                    if _can_final:
                         # Сколько минут потребовалось вернуться
                         since_peak = round((now_t - (prev or d).get("since", now_t)) / 60)
 
@@ -3635,14 +3754,20 @@ def pseudo_loop(symbols_ref):
                 # ── РЕТЕСТ ХАЯ: цена вернулась в шорт-зону (отдельный случай) ──
                 # Шлём только если до этого НЕ было финального алерта
                 at_retest = d["retest_low"] <= close_now <= d["retest_high"]
-                final_sent = pseudo_alert_cache.get(f"pseudo_final_{sym}", 0) > \
-                             pseudo_alert_cache.get(f"pseudo_retest_{sym}", 0)
+                with _pseudo_alert_lock:
+                    _final_ts  = pseudo_alert_cache.get(f"pseudo_final_{sym}", 0)
+                    _retest_ts = pseudo_alert_cache.get(f"pseudo_retest_{sym}", 0)
+                final_sent = _final_ts > _retest_ts
 
                 if at_retest and not final_sent:
                     key = f"pseudo_retest_{sym}"
                     now_t = time.time()
-                    if now_t - pseudo_alert_cache.get(key, 0) >= 600:
-                        pseudo_alert_cache[key] = now_t
+                    # FIX S1-1: атомарная проверка+запись под lock
+                    with _pseudo_alert_lock:
+                        _can_retest = (now_t - pseudo_alert_cache.get(key, 0) >= 600)
+                        if _can_retest:
+                            pseudo_alert_cache[key] = now_t
+                    if _can_retest:
                         msg_r = (
                             f"{make_header('zone', sym, 'РЕТЕСТ ХАЯ ПСЕВДОПАМПА')}\n"
                             f"{make_divider('zone')}\n"
@@ -3707,6 +3832,8 @@ def pseudo_loop(symbols_ref):
 
 def build_splash_chart(symbol, k1):
     """График для SPLASH-алерта: 1m свечи + подсветка окна взрыва."""
+    # FIX S1-5: объявляем fig заранее для finally-закрытия
+    fig = None
     try:
         if not k1 or len(k1) < 5:
             return None
@@ -3845,6 +3972,24 @@ def splash_loop(symbols_ref):
                 last = splash_alert_cache.get(sym, 0)
                 if now - last < SPLASH_COOLDOWN:
                     return
+
+                # FIX S2-1: подавляем SPLASH если по монете за последний час
+                # уже были алерты от inplay или pseudo модуля.
+                # SPLASH дублировал информацию для PIEVERSEUSDT и других монет
+                # которые уже отслеживались другими детекторами.
+                SPLASH_SUPPRESS_MINS = 60  # минут — окно подавления
+                suppress_threshold = now - SPLASH_SUPPRESS_MINS * 60
+                with inplay_lock:
+                    in_inplay = sym in inplay_coins
+                with pseudo_lock:
+                    in_pseudo = sym in pseudo_coins
+                if in_inplay or in_pseudo:
+                    last_inplay = inplay_alert_cache.get(f"{sym}_inplay", 0)
+                    last_pseudo = pseudo_alert_cache.get(f"pseudo_{sym}", 0)
+                    if max(last_inplay, last_pseudo) > suppress_threshold:
+                        print(f"  [SPLASH] ⏭ {sym} подавлен — монета в inplay/pseudo")
+                        return
+
                 splash_alert_cache[sym] = now
 
                 chg       = result["change_pct"]
@@ -3879,16 +4024,42 @@ def splash_loop(symbols_ref):
             except Exception as e:
                 print(f"  [SPLASH ERR {sym}] {e}")
 
+        # FIX S4-2: SPLASH больше не сканирует ВСЕ ~300 символов каждую минуту.
+        # Приоритет — монеты уже замеченные другими детекторами (active+inplay+pseudo).
+        # Остальные сканируются случайной выборкой 60 монет за итерацию.
+        # Это снижает нагрузку с ~300 до ~80 запросов/мин (экономия ~75%).
+        priority_syms: set = set()
+        with active_lock:
+            priority_syms.update(active_coins.keys())
+        with inplay_lock:
+            priority_syms.update(inplay_coins.keys())
+        with pseudo_lock:
+            priority_syms.update(pseudo_coins.keys())
+        other_syms = [s for s in symbols if s not in priority_syms]
+        # Случайная выборка из неприоритетных (до 60 штук)
+        sample_size = max(0, 60 - len(priority_syms))
+        scan_list = list(priority_syms) + random.sample(other_syms, min(sample_size, len(other_syms)))
+
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            list(pool.map(process_splash, symbols))
+            list(pool.map(process_splash, scan_list))
 
         elapsed = time.time() - start
         time.sleep(max(0, 60 - elapsed))
 
+# FIX S6-1: статистика сигналов теперь хранится в PostgreSQL (таблица signal_stats),
+# а не в /tmp/signal_stats.json — который очищается при каждом рестарте на Railway.
+# Схема резервирования: если БД недоступна → fallback на /tmp как раньше.
 
-import json
+STATS_FILE = "/tmp/signal_stats.json"  # резервный файл (fallback без БД)
 
-STATS_FILE = "/tmp/signal_stats.json"
+_STATS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS signal_stats (
+    id          TEXT PRIMARY KEY,
+    data        TEXT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ss_updated ON signal_stats(updated_at DESC);
+"""
 
 # Структура записи: { id, symbol, time, zone_low, zone_high, zq_score,
 #                    zq_verdict, rec_pct, close_at_signal,
@@ -3898,21 +4069,92 @@ signal_tracker: dict = {}
 tracker_lock = threading.Lock()
 
 
+def _ensure_stats_table() -> bool:
+    """Создаёт таблицу signal_stats если её нет. Возвращает True при успехе."""
+    if not _PUMP_DB_AVAILABLE:
+        return False
+    try:
+        db = _get_pump_db()
+        if db.conn is None:
+            return False
+        with db.conn.cursor() as cur:
+            cur.execute(_STATS_TABLE_SQL)
+        return True
+    except Exception as e:
+        print(f"  [STATS DB] Ошибка создания таблицы: {e}")
+        return False
+
+
+def _db_stats_available() -> bool:
+    if not _PUMP_DB_AVAILABLE:
+        return False
+    try:
+        return _get_pump_db().conn is not None
+    except Exception:
+        return False
+
+
 def load_stats():
+    """Загружает статистику: сначала из PostgreSQL, потом из /tmp как резерв."""
     global signal_tracker
+    # Попытка загрузить из PostgreSQL
+    if _db_stats_available():
+        try:
+            _ensure_stats_table()
+            db = _get_pump_db()
+            with db.conn.cursor() as cur:
+                cur.execute("SELECT id, data FROM signal_stats ORDER BY updated_at DESC LIMIT 5000")
+                rows = cur.fetchall()
+            if rows:
+                signal_tracker = {}
+                for row_id, row_data in rows:
+                    try:
+                        entry = json.loads(row_data)
+                        signal_tracker[row_id] = entry
+                    except Exception:
+                        pass
+                print(f"  [STATS] ✅ Загружено из PostgreSQL: {len(signal_tracker)} записей")
+                return
+        except Exception as e:
+            print(f"  [STATS DB] Ошибка загрузки: {e}")
+    # Fallback: /tmp
     try:
         with open(STATS_FILE, "r") as f:
             signal_tracker = json.load(f)
+        print(f"  [STATS] ℹ️ Загружено из /tmp: {len(signal_tracker)} записей")
     except Exception:
         signal_tracker = {}
+        print("  [STATS] ℹ️ Новая база статистики")
 
 
 def save_stats():
+    """Сохраняет статистику: в PostgreSQL + /tmp как резерв."""
+    # PostgreSQL (основной)
+    if _db_stats_available():
+        try:
+            db = _get_pump_db()
+            with tracker_lock:
+                items = list(signal_tracker.items())
+            with db.conn.cursor() as cur:
+                for sid, entry in items:
+                    cur.execute(
+                        """INSERT INTO signal_stats (id, data, updated_at)
+                           VALUES (%s, %s, NOW())
+                           ON CONFLICT (id) DO UPDATE
+                           SET data = EXCLUDED.data, updated_at = NOW()""",
+                        (sid, json.dumps(entry, ensure_ascii=False))
+                    )
+            return
+        except Exception as e:
+            print(f"  [STATS DB] Ошибка сохранения в PostgreSQL: {e}")
+    # Fallback: /tmp
     try:
+        with tracker_lock:
+            snap = dict(signal_tracker)
         with open(STATS_FILE, "w") as f:
-            json.dump(signal_tracker, f, ensure_ascii=False, indent=2)
+            json.dump(snap, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"  [STATS] Ошибка сохранения: {e}")
+        print(f"  [STATS] Ошибка сохранения в /tmp: {e}")
 
 
 def register_signal(symbol, zone_low, zone_high, zq_score, zq_verdict,
@@ -4791,6 +5033,8 @@ def get_premium_index(symbol):
 
 def build_deviation_chart(symbol, k1, mark, index):
     """График с линиями mark price и index price."""
+    # FIX S1-5: объявляем fig заранее для finally-закрытия
+    fig = None
     try:
         if not k1 or len(k1) < 5:
             return None
@@ -4856,11 +5100,15 @@ def build_deviation_chart(symbol, k1, mark, index):
         plt.tight_layout(pad=1.2)
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
-        plt.close(fig); buf.seek(0)
+        buf.seek(0)
         return buf.read()
     except Exception as e:
         print(f"  [DEV CHART ERR {symbol}] {e}")
         return None
+    finally:
+        # FIX S1-5: гарантированное закрытие figure — предотвращает утечку памяти
+        if fig is not None:
+            plt.close(fig)
 
 
 def deviation_scan_loop(symbols_ref):
@@ -4944,6 +5192,8 @@ def deviation_scan_loop(symbols_ref):
 
 def build_inplay_digest_chart(symbol, k1):
     """Простой 1m график для дайджеста."""
+    # FIX S1-5: объявляем fig заранее для finally-закрытия
+    fig = None
     try:
         data   = k1[-60:]
         n      = len(data)
@@ -4994,11 +5244,15 @@ def build_inplay_digest_chart(symbol, k1):
         plt.tight_layout(pad=1.0)
         buf = io.BytesIO()
         plt.savefig(buf, format="png", dpi=100, facecolor="#0d1117")
-        plt.close(fig); buf.seek(0)
+        buf.seek(0)
         return buf.read()
     except Exception as e:
         print(f"  [DIGEST CHART ERR {symbol}] {e}")
         return None
+    finally:
+        # FIX S1-5: гарантированное закрытие figure — предотвращает утечку памяти
+        if fig is not None:
+            plt.close(fig)
 
 
 def hourly_inplay_digest():
@@ -5015,8 +5269,21 @@ def hourly_inplay_digest():
         with inplay_lock:
             snapshot = dict(inplay_coins)
 
+        # FIX S3-3: включаем в дайджест монеты из active_coins и pseudo_coins тоже
+        with active_lock:
+            for sym, st in active_coins.items():
+                if sym not in snapshot:
+                    snapshot[sym] = {**st, "_source": "active"}
+        with pseudo_lock:
+            for sym, st in pseudo_coins.items():
+                if sym not in snapshot:
+                    snapshot[sym] = {**st, "_source": "pseudo"}
+
         if not snapshot:
-            send_message("📋 <b>Инплей дайджест</b>\nНет активных монет")
+            # FIX S3-5: пустой дайджест — тихий лог вместо отправки сообщения
+            # Раньше отправлялось "Нет активных монет" даже когда монеты были
+            # (просто истёкший TTL) — это путало пользователей
+            print(f"  [DIGEST] ℹ️ {datetime.now().strftime('%H:%M')} — нет активных монет, дайджест пропущен")
             continue
 
         # Заголовок дайджеста
@@ -5043,15 +5310,24 @@ def hourly_inplay_digest():
                 # Объём за последний час
                 k1h = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                             {"symbol": sym, "interval": "1h", "limit": 2})
-                vol_1h = float(k1h[-2][7]) if k1h and len(k1h) >= 2 else 0
+                # FIX S1-6: k1h[-2] брал ПРЕДЫДУЩИЙ закрытый час, теперь k1h[-1]
+                # берёт текущий (накопленный) объём — актуальнее для дайджеста
+                vol_1h = float(k1h[-1][7]) if k1h and len(k1h) >= 1 else 0
 
                 zone_high = state.get("zone_high", 0)
                 zone_low  = state.get("zone_low", 0)
                 dist = (close - zone_high) / zone_high * 100 if zone_high else 0
                 zq   = state.get("zq_score", "?")
 
+                natr_val  = data.get("natr", calc_natr(k1) if k1 else 1.0)
+                natr_m    = natr_mode(natr_val)
+                # FIX S3-4: добавляем режим NATR (NORMAL/HOT/WILD) в дайджест
+                mode_tag = {"WILD": "⚡ WILD", "HOT": "🔥 HOT", "NORMAL": "✅ NORMAL"}.get(natr_m, natr_m)
+                source_tag = {"active": "🔵 L1/L2", "pseudo": "🔵 Псевдо", "inplay": "🟢 Инплей"}.get(
+                    data.get("_source", "inplay"), "🟢 Инплей")
+
                 caption = (
-                    f"<code>{sym}</code> · {day_chg:+.1f}% за день\n"
+                    f"<code>{sym}</code> · {day_chg:+.1f}% за день · {source_tag} · {mode_tag} (NATR {natr_val:.1f}%)\n"
                     f"Цена: <b>{close:.6g}</b> · Объём 1ч: <b>{fmt_usd(vol_1h)}</b>\n"
                     f"Зона: {zone_low:.6g}–{zone_high:.6g} · До зоны: {dist:+.1f}%\n"
                     f"Надёжность: {zq}/10"
@@ -5075,6 +5351,29 @@ def hourly_inplay_digest():
 
 def main():
     print("🚀 Crypto Screener v4 — 3-слойная архитектура\n")
+
+    # ── FIX S6-3: Health-check HTTP сервер для Railway ──────────────────────
+    # Railway требует открытый порт для keep-alive мониторинга.
+    # Без этого платформа считает сервис «упавшим» и перезапускает его.
+    # Запускается на порту $PORT (Railway задаёт автоматически) или 8080.
+    import http.server, socketserver
+    _health_port = int(os.environ.get("PORT", 8080))
+    class _HealthHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, *args):
+            pass  # заглушаем HTTP-логи в stdout
+    def _run_health():
+        try:
+            with socketserver.TCPServer(("", _health_port), _HealthHandler) as srv:
+                print(f"  [HEALTH] HTTP health-check на порту {_health_port}")
+                srv.serve_forever()
+        except Exception as e:
+            print(f"  [HEALTH ERR] {e}")
+    threading.Thread(target=_run_health, daemon=True).start()
+    # ────────────────────────────────────────────────────────────────────────
 
     # PostgreSQL хранилище псевдопампов
     if _PUMP_DB_AVAILABLE:
