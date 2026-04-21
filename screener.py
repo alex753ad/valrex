@@ -12,7 +12,7 @@ import time
 import threading
 import io
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import matplotlib
@@ -61,6 +61,7 @@ RADIUS_WILD         = 1.5      # %
 
 # Фильтр ликвидности
 MIN_VOL_5M_USD      = 100_000  # минимум $100k объёма за последние 5 мин
+MIN_VOL_1M_USD      = 20_000   # минимум $20k объёма за последнюю 1 мин (Layer 3)
 MIN_NATR            = 0.9      # минимальный NATR для наблюдения (%)
 
 # Инплей модуль
@@ -93,6 +94,7 @@ SPLASH_WINDOW_MIN   = 5        # окно в минутах (1m-свечи)
 SPLASH_MIN_VOL_USD  = 200_000  # минимальный объём за окно ($)
 SPLASH_COOLDOWN     = 300      # сек между алертами по одной монете
 splash_alert_cache: dict = {}
+_splash_alert_lock = threading.Lock()   # FIX B-15: защита от race condition в 20+ потоках
 
 # Расхождение цены — порог алерта
 DEVIATION_THRESHOLD_NEW = 2.9  # % (показываем только от 2.9%)
@@ -290,7 +292,7 @@ http_session.headers.update({"User-Agent": "CryptoScreener/4.0"})
 #  ПРОКСИ
 # ─────────────────────────────────────────────
 
-def _webshare_to_proxy_dict(entry: str) -> dict:
+def _webshare_to_proxy_dict(entry: str) -> dict | None:
     """Конвертирует 'ip:port:user:pass' в requests-совместимый dict."""
     parts = entry.strip().split(":")
     if len(parts) == 4:
@@ -298,6 +300,9 @@ def _webshare_to_proxy_dict(entry: str) -> dict:
         url = f"http://{user}:{pwd}@{ip}:{port}"
         return {"http": url, "https": url}
     # fallback: ip:port без авторизации
+    if len(parts) < 2:
+        print(f"  [PROXY] ⚠️ Некорректная запись прокси (пропущена): {entry!r}")
+        return None
     ip, port = parts[0], parts[1]
     url = f"http://{ip}:{port}"
     return {"http": url, "https": url}
@@ -349,6 +354,8 @@ def find_working_proxy():
     random.shuffle(shuffled)
     for entry in shuffled:
         pd = _webshare_to_proxy_dict(entry)
+        if pd is None:
+            continue
         if test_proxy(pd):
             with proxy_lock:
                 current_proxy = pd
@@ -466,6 +473,8 @@ def calc_natr(candles):
     return round(atr / close * 100, 2) if close else 0.0
 
 def ema(data, period):
+    if len(data) < period:
+        return []
     k = 2 / (period + 1)
     result = [sum(data[:period]) / period]
     for p in data[period:]:
@@ -847,6 +856,12 @@ def build_chart(symbol, candles, levels=None, alert_type="inplay"):
         # при исключении в процессе отрисовки (OOM на Railway за несколько часов)
         if fig is not None:
             plt.close(fig)
+
+
+# FIX B-02: функция была встроена внутрь build_chart как мёртвый код после return.
+# Вынесена на уровень модуля — теперь корректно вызывается из всех алерт-модулей.
+def send_photo(image_bytes: bytes, caption: str):
+    """Отправляет фото (график) в Telegram-канал."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     try:
         r = requests.post(url, data={"chat_id": TELEGRAM_CHANNEL_ID,
@@ -856,6 +871,7 @@ def build_chart(symbol, candles, levels=None, alert_type="inplay"):
             print(f"  [TG ERR] {r.json()}")
     except Exception as e:
         print(f"  [TG EXC] {e}")
+
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -1093,19 +1109,31 @@ def layer1_loop(symbols_ref):
 
             with active_lock:
                 already_active = sym in active_coins
-                active_coins[sym] = {
-                    "since":          time.time(),
-                    "impulse_close":  imp_close,
-                    "impulse_high":   imp_high,
-                    "impulse_low":    imp_low,
-                    "impulse_price":  cur_close,
-                    "vol_mult":       mult,
-                    "touches":        active_coins.get(sym, {}).get("touches", 0),
-                    "levels":         active_coins.get(sym, {}).get("levels", []),
-                    "last_level_scan": 0,
-                    "last_natr":      2.0,
-                    "pullback_high":  0,
-                }
+                if already_active:
+                    # Обновляем только импульсные данные — не сбрасываем last_l2_scan,
+                    # last_natr, touches, levels, pullback_* накопленные Layer 2
+                    active_coins[sym].update({
+                        "since":         time.time(),
+                        "impulse_close": imp_close,
+                        "impulse_high":  imp_high,
+                        "impulse_low":   imp_low,
+                        "impulse_price": cur_close,
+                        "vol_mult":      mult,
+                    })
+                else:
+                    active_coins[sym] = {
+                        "since":           time.time(),
+                        "impulse_close":   imp_close,
+                        "impulse_high":    imp_high,
+                        "impulse_low":     imp_low,
+                        "impulse_price":   cur_close,
+                        "vol_mult":        mult,
+                        "touches":         0,
+                        "levels":          [],
+                        "last_level_scan": 0,
+                        "last_natr":       2.0,
+                        "pullback_high":   0,
+                    }
 
             if not already_active:
                 # Слой 1 работает молча — только добавляет монету в наблюдение
@@ -1205,6 +1233,11 @@ def detect_pullback(symbol, state, k1):
                             active_coins[symbol]["pullback_high"] = recent_high
                     # Откат отслеживается внутренне — уведомление придёт при касании уровня
                     print(f"  [PB] 📉 {symbol} откат {drop_pct:.1f}% → поддержка {nearest['price']:.6g}")
+
+    # ── ОТСКОК ОТ ЛОЯ (дамп → цена растёт к сопротивлению) ──
+    recent_low = min(lows[-10:])
+    rise_pct   = (close - recent_low) / recent_low * 100 if recent_low > 0 else 0
+    going_up   = closes[-1] > closes[-2] and closes[-2] > closes[-3]
 
     if rise_pct >= natr * 0.5 and going_up:
         res_levels = [lv for lv in levels if lv["type"] == "res" and lv["price"] > close]
@@ -1367,8 +1400,8 @@ def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
     # Объём за последнюю 1m свечу (в USD)
     last_1m_vol_usd = float(k1[-1][7]) if k1 else 0
 
-    # Фильтр: объём за последнюю минуту < $100k — пропускаем
-    if last_1m_vol_usd < MIN_VOL_5M_USD:
+    # Фильтр: объём за последнюю минуту < $20k — пропускаем
+    if last_1m_vol_usd < MIN_VOL_1M_USD:
         return
 
     # Стакан (последним)
@@ -1384,7 +1417,8 @@ def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
     ob_pressure = get_order_book_pressure(symbol, vol_mult_val)
 
     # Рейтинг
-    stars = calc_stars(True, pat_dir, sig_dir, trend, vol_mult_val,
+    near_level_flag = True  # layer3 вызывается только при near=True из layer2
+    stars = calc_stars(near_level_flag, pat_dir, sig_dir, trend, vol_mult_val,
                        cvd, touch_num, ob_pressure, mode)
 
     if stars < MIN_STARS:
@@ -1486,116 +1520,6 @@ def find_broken_levels(k1, k5, k15, current_price):
     return broken
 
 
-def find_body_levels(k1, min_cluster=3, tol_pct=0.15):
-    """
-    Находит уровни по ЗАКРЫТИЯМ ТЕЛ свечей (не по хвостам).
-
-    Алгоритм:
-    1. Берём closes всех свечей
-    2. Ищем кластеры: 2+ свечи подряд где |close[i] - close[j]| / close < tol_pct%
-    3. Медиана close кластера = уровень
-    4. Хвосты игнорируются при построении — они нужны только для detect_wick_rejects
-
-    Возвращает список dict: price, candle_count, strength
-    """
-    if not k1 or len(k1) < min_cluster:
-        return []
-
-    closes = [float(c[4]) for c in k1]
-    n = len(closes)
-    used = [False] * n
-    levels = []
-
-    for i in range(n):
-        if used[i]:
-            continue
-        cluster = [i]
-        ref = closes[i]
-        for j in range(i + 1, min(i + 20, n)):
-            if used[j]:
-                break
-            if abs(closes[j] - ref) / ref * 100 <= tol_pct:
-                cluster.append(j)
-            elif len(cluster) >= 2:
-                break   # разрыв — останавливаемся
-
-        if len(cluster) < min_cluster:
-            continue
-
-        for idx in cluster:
-            used[idx] = True
-
-        price = sorted([closes[k] for k in cluster])[len(cluster) // 2]  # медиана
-        # Сила уровня: кол-во свечей + бонус за длину
-        strength = len(cluster) + (2 if len(cluster) >= 5 else 0)
-        levels.append({
-            "price":        round(price, 8),
-            "candle_count": len(cluster),
-            "strength":     strength,
-            "tf":           "1m",
-            "type":         "body",
-        })
-
-    return levels
-
-
-def detect_wick_rejects(k1, level_price, tol_pct=0.15):
-    """
-    Считает кол-во заколов хвостами у уровня:
-    закол = low пробивал уровень (low < level - tol), но close закрылся выше.
-    Это паттерн «закол → возврат» — подтверждение реального уровня по телам.
-
-    Возвращает: count (int), последние ts заколов (list)
-    """
-    count = 0
-    tol   = level_price * (tol_pct / 100)
-    times = []
-    for c in k1:
-        low   = float(c[3])
-        close = float(c[4])
-        if low < level_price - tol and close > level_price:
-            count += 1
-            times.append(int(c[0]))
-    return count, times
-
-
-def cluster_body_levels(levels, tol_pct=0.20):
-    """
-    Объединяет body-уровни попавшие в ±tol_pct% друг от друга в кластер.
-    Вес кластера = сумма strength. ZQ-бонус считается снаружи.
-    Возвращает список кластеров отсортированных по цене.
-    """
-    if not levels:
-        return []
-
-    sorted_lv = sorted(levels, key=lambda x: x["price"])
-    clusters  = []
-    cur       = [sorted_lv[0]]
-
-    for lv in sorted_lv[1:]:
-        ref = cur[0]["price"]
-        if abs(lv["price"] - ref) / ref * 100 <= tol_pct:
-            cur.append(lv)
-        else:
-            clusters.append(cur)
-            cur = [lv]
-    clusters.append(cur)
-
-    result = []
-    for cl in clusters:
-        prices    = [x["price"] for x in cl]
-        total_str = sum(x["strength"] for x in cl)
-        result.append({
-            "price":        round(sorted([prices[len(prices)//2]])[0], 8),
-            "price_min":    min(prices),
-            "price_max":    max(prices),
-            "count":        len(cl),
-            "strength":     total_str,
-            "cluster":      len(cl) >= 3,   # True = кластер, False = одиночный уровень
-            "tf":           "1m",
-            "type":         "body_cluster" if len(cl) >= 3 else "body",
-        })
-    return result
 
 
 def find_round_numbers_in_zone(low, high):
@@ -1811,6 +1735,9 @@ def zq_bonus_body_levels(body_levels: list) -> tuple[int, list]:
             flags.append(f"✅ Заколы хвостами ×{lv['wick_rejects']} — уровень рабочий (+1 ZQ)")
             break
     return min(score, 3), flags
+
+
+def get_oi_history(symbol: str):
     """Получает историю OI за последние 30 минут (5m свечи)."""
     data = fetch("https://fapi.binance.com/futures/data/openInterestHist",
                  {"symbol": symbol, "period": "5m", "limit": 10})
@@ -3929,13 +3856,10 @@ def scan_splash(symbol):
     if abs(change_pct) < threshold:
         return None
 
-    # BTC движется в том же направлении — это корреляция, не SPLASH
+    # BTC движется в том же направлении — это корреляция, не SPLASH.
+    # Примечание: порог уже умножен на MARKET_CORR_MULTIPLIER в effective_splash_threshold(),
+    # поэтому скоррелированные движения вместе с BTC отсеиваются выше автоматически.
     ctx = get_market_context()
-    if ctx["correlated"]:
-        btc_dir   = 1 if ctx["btc_change_5m"] > 0 else -1
-        coin_dir  = 1 if change_pct > 0 else -1
-        if btc_dir == coin_dir and abs(change_pct) < threshold:
-            return None   # движение скоррелировано с BTC, уже отфильтровано выше
 
     vol_window = sum(float(c[7]) for c in window[1:])
     if vol_window < SPLASH_MIN_VOL_USD:
@@ -3969,9 +3893,13 @@ def splash_loop(symbols_ref):
                     return
 
                 now  = time.time()
-                last = splash_alert_cache.get(sym, 0)
-                if now - last < SPLASH_COOLDOWN:
-                    return
+                # FIX B-15: атомарное check-and-set через lock — устраняет race condition
+                # при одновременной работе 20+ потоков ThreadPoolExecutor
+                with _splash_alert_lock:
+                    last = splash_alert_cache.get(sym, 0)
+                    if now - last < SPLASH_COOLDOWN:
+                        return
+                    splash_alert_cache[sym] = now
 
                 # FIX S2-1: подавляем SPLASH если по монете за последний час
                 # уже были алерты от inplay или pseudo модуля.
@@ -3989,8 +3917,6 @@ def splash_loop(symbols_ref):
                     if max(last_inplay, last_pseudo) > suppress_threshold:
                         print(f"  [SPLASH] ⏭ {sym} подавлен — монета в inplay/pseudo")
                         return
-
-                splash_alert_cache[sym] = now
 
                 chg       = result["change_pct"]
                 direction = "🚀" if chg > 0 else "💥"
@@ -4144,6 +4070,7 @@ def save_stats():
                            SET data = EXCLUDED.data, updated_at = NOW()""",
                         (sid, json.dumps(entry, ensure_ascii=False))
                     )
+            db.conn.commit()   # FIX B-08: без commit транзакция откатывается при закрытии
             return
         except Exception as e:
             print(f"  [STATS DB] Ошибка сохранения в PostgreSQL: {e}")
@@ -4623,7 +4550,6 @@ def daily_stats_loop():
     print("  [STATS] Планировщик статистики запущен")
     while True:
         now    = datetime.now()
-        from datetime import timedelta
         target = (now + timedelta(days=1)).replace(hour=9, minute=0,
                                                     second=0, microsecond=0)
         wait_sec = max(0, (target - now).total_seconds())
@@ -4751,7 +4677,7 @@ def build_winrate_message() -> str:
 
     lines = [
         f"{make_header('stats', '', 'WIN RATE ПО МОНЕТАМ')}",
-        make_divider("stats") * 19,
+        make_divider("stats"),
         "",
         "🏆 <b>Топ монет (ZQ работает):</b>",
     ]
@@ -4789,7 +4715,7 @@ def build_winrate_message() -> str:
     overall    = round(total_wins / total_fin * 100) if total_fin > 0 else 0
     lines += [
         "",
-        make_divider("stats") * 19,
+        make_divider("stats"),
         f"Всего сигналов: <b>{total_all}</b> · "
         f"Общий win rate: <b>{overall}%</b>",
     ]
@@ -4864,7 +4790,7 @@ def recalibrate_thresholds():
 
     msg_lines = [
         f"{make_header('stats', '', 'АВТО-КАЛИБРОВКА ПОРОГОВ')}",
-        make_divider("stats") * 19,
+        make_divider("stats"),
         f"Данных для анализа: <b>{n_total}</b> сигналов",
         f"Базовый win rate:   <b>{baseline}%</b>",
         "",
@@ -4878,7 +4804,7 @@ def recalibrate_thresholds():
 
     msg_lines += [
         "",
-        make_divider("stats") * 19,
+        make_divider("stats"),
         f"Следующая калибровка через 7 дней",
     ]
     send_message("\n".join(msg_lines))
@@ -4887,11 +4813,10 @@ def recalibrate_thresholds():
 
 def weekly_recalibrate_loop():
     """Запускает авто-калибровку каждое воскресенье в 08:00 UTC."""
-    from datetime import timedelta
     print("  [CALIB] Планировщик авто-калибровки запущен")
     while True:
-        now    = datetime.utcnow()
-        # Следующее воскресенье 08:00 UTC
+        now    = datetime.now()
+        # Следующее воскресенье 08:00 (локальное время)
         days_until_sun = (6 - now.weekday()) % 7 or 7
         target = (now + timedelta(days=days_until_sun)).replace(
             hour=8, minute=0, second=0, microsecond=0)
@@ -5255,13 +5180,59 @@ def build_inplay_digest_chart(symbol, k1):
             plt.close(fig)
 
 
+def _fmt_chg(v: float) -> str:
+    """Форматирует % изменение с цветом через HTML-тег (для таблицы дайджеста)."""
+    sign = "+" if v >= 0 else ""
+    return f"{sign}{v:.1f}"
+
+
+def _fmt_vol_short(v: float) -> str:
+    """Компактный объём: 1.2B, 420M, 54M."""
+    if v >= 1_000_000_000: return f"{v/1_000_000_000:.1f}B"
+    if v >= 1_000_000:     return f"{v/1_000_000:.0f}M"
+    if v >= 1_000:         return f"{v/1_000:.0f}k"
+    return str(int(v))
+
+
+def _build_digest_table(rows: list[dict]) -> str:
+    """
+    Формирует моноширинную таблицу дайджеста в стиле скрина:
+
+    TICKER        CHG    RANGE  NATR    VOL
+                TODAY   1M/5   5M/14   24H
+    ─────────────────────────────────────────
+    SUPER         +29.1   3.9    3.5    54M
+    HIGH          +23.9   3.3    3.8   420M
+    AIOT          -22.5   1.4    1.7    41M
+
+    Поля: ticker, chg_today, range_1m5, natr_5m14, vol_24h
+    """
+    hdr1 = f"{'TICKER':<10}{'CHANGE':>8}  {'RANGE':>6}  {'NATR':>6}  {'VOL':>6}"
+    hdr2 = f"{'':10}{'TODAY':>8}  {'1M/5':>6}  {'5M/14':>6}  {'24H':>6}"
+    sep  = "─" * len(hdr1)
+    lines = [hdr1, hdr2, sep]
+    for r in rows:
+        ticker  = r.get("ticker", "")[:10]
+        chg     = r.get("chg_today", 0.0)
+        rng     = r.get("range_1m5", 0.0)
+        natr    = r.get("natr_5m14", 0.0)
+        vol     = r.get("vol_24h", 0.0)
+        chg_s   = _fmt_chg(chg)
+        vol_s   = _fmt_vol_short(vol)
+        # Жирный NATR если HOT/WILD
+        natr_s  = f"{natr:.1f}"
+        lines.append(
+            f"{ticker:<10}{chg_s:>8}  {rng:>6.1f}  {natr_s:>6}  {vol_s:>6}"
+        )
+    return "\n".join(lines)
+
+
 def hourly_inplay_digest():
     """Каждый час отправляет дайджест всех инплей монет."""
     print("  [DIGEST] Часовой дайджест запущен")
     while True:
         # Ждём до следующего часа :00
         now    = datetime.now()
-        from datetime import timedelta
         next_h = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         wait   = (next_h - now).total_seconds()
         time.sleep(wait)
@@ -5280,59 +5251,102 @@ def hourly_inplay_digest():
                     snapshot[sym] = {**st, "_source": "pseudo"}
 
         if not snapshot:
-            # FIX S3-5: пустой дайджест — тихий лог вместо отправки сообщения
-            # Раньше отправлялось "Нет активных монет" даже когда монеты были
-            # (просто истёкший TTL) — это путало пользователей
             print(f"  [DIGEST] ℹ️ {datetime.now().strftime('%H:%M')} — нет активных монет, дайджест пропущен")
             continue
 
-        # Заголовок дайджеста
-        header = (f"📋 <b>Инплей дайджест</b> · {datetime.now().strftime('%H:%M')}\n"
-                  f"Монет в наблюдении: <b>{len(snapshot)}</b>\n"
-                  f"━━━━━━━━━━━━━━━━━━━")
-        send_message(header)
+        # ── Собираем данные для сводной таблицы ──────────────────────────────
+        table_rows = []
+        per_coin_data = {}   # sym → dict с данными для индивидуальных карточек
 
-        # По каждой монете — график + краткая сводка
         for sym, state in list(snapshot.items()):
             try:
-                k1 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                           {"symbol": sym, "interval": "1m", "limit": 60})
-                if not k1:
-                    continue
-
-                close  = float(k1[-1][4])
-                # Изменение за день
+                k1m = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                            {"symbol": sym, "interval": "1m", "limit": 60})
+                k5m = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                            {"symbol": sym, "interval": "5m", "limit": 16})
                 k1d = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                             {"symbol": sym, "interval": "1d", "limit": 2})
+
+                close     = float(k1m[-1][4]) if k1m else 0
                 day_open  = float(k1d[0][1]) if k1d and len(k1d) >= 1 else close
                 day_chg   = (close - day_open) / day_open * 100 if day_open > 0 else 0
+                vol_24h   = float(k1d[-1][7]) if k1d else 0
 
-                # Объём за последний час
-                k1h = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
-                            {"symbol": sym, "interval": "1h", "limit": 2})
-                # FIX S1-6: k1h[-2] брал ПРЕДЫДУЩИЙ закрытый час, теперь k1h[-1]
-                # берёт текущий (накопленный) объём — актуальнее для дайджеста
-                vol_1h = float(k1h[-1][7]) if k1h and len(k1h) >= 1 else 0
+                # RANGE 1m/5: размах последних 5 однаминутных свечей как % от цены
+                if k1m and len(k1m) >= 5:
+                    last5 = k1m[-5:]
+                    rng_hi = max(float(c[2]) for c in last5)
+                    rng_lo = min(float(c[3]) for c in last5)
+                    range_1m5 = (rng_hi - rng_lo) / close * 100 if close else 0
+                else:
+                    range_1m5 = 0.0
 
+                # FIX B-03: было data.get(...) — исправлено на state.get(...)
+                natr_val = state.get("natr", calc_natr(k1m) if k1m else 1.0)
+                source   = state.get("_source", "inplay")
+
+                table_rows.append({
+                    "ticker":    sym.replace("USDT", ""),
+                    "chg_today": day_chg,
+                    "range_1m5": range_1m5,
+                    "natr_5m14": natr_val,
+                    "vol_24h":   vol_24h,
+                })
+                per_coin_data[sym] = {
+                    "k1m":      k1m,
+                    "k5m":      k5m,
+                    "close":    close,
+                    "day_chg":  day_chg,
+                    "natr_val": natr_val,
+                    "vol_24h":  vol_24h,
+                    "source":   source,
+                    "state":    state,
+                }
+            except Exception as e:
+                print(f"  [DIGEST COLLECT ERR {sym}] {e}")
+
+        # Сортируем по |chg_today| убыванию (самые активные — первые)
+        table_rows.sort(key=lambda r: abs(r["chg_today"]), reverse=True)
+
+        # ── Заголовок-таблица — один сводный блок ────────────────────────────
+        table_txt = _build_digest_table(table_rows)
+        header = (
+            f"📋 <b>Инплей дайджест</b> · {datetime.now().strftime('%H:%M')}\n"
+            f"Монет в наблюдении: <b>{len(snapshot)}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"<pre>{table_txt}</pre>"
+        )
+        send_message(header)
+
+        # ── Индивидуальные карточки с графиком ───────────────────────────────
+        for sym, d in per_coin_data.items():
+            try:
+                state    = d["state"]
+                k1m      = d["k1m"]
+                close    = d["close"]
+                day_chg  = d["day_chg"]
+                natr_val = d["natr_val"]
+                vol_24h  = d["vol_24h"]
+
+                # FIX B-03: было data.get('_source') — исправлено на state.get
+                source   = state.get("_source", "inplay")
                 zone_high = state.get("zone_high", 0)
                 zone_low  = state.get("zone_low", 0)
                 dist = (close - zone_high) / zone_high * 100 if zone_high else 0
                 zq   = state.get("zq_score", "?")
 
-                natr_val  = data.get("natr", calc_natr(k1) if k1 else 1.0)
-                natr_m    = natr_mode(natr_val)
-                # FIX S3-4: добавляем режим NATR (NORMAL/HOT/WILD) в дайджест
-                mode_tag = {"WILD": "⚡ WILD", "HOT": "🔥 HOT", "NORMAL": "✅ NORMAL"}.get(natr_m, natr_m)
+                natr_m     = natr_mode(natr_val)
+                mode_tag   = {"WILD": "⚡ WILD", "HOT": "🔥 HOT", "NORMAL": "✅ NORMAL"}.get(natr_m, natr_m)
                 source_tag = {"active": "🔵 L1/L2", "pseudo": "🔵 Псевдо", "inplay": "🟢 Инплей"}.get(
-                    data.get("_source", "inplay"), "🟢 Инплей")
+                    source, "🟢 Инплей")
 
                 caption = (
                     f"<code>{sym}</code> · {day_chg:+.1f}% за день · {source_tag} · {mode_tag} (NATR {natr_val:.1f}%)\n"
-                    f"Цена: <b>{close:.6g}</b> · Объём 1ч: <b>{fmt_usd(vol_1h)}</b>\n"
+                    f"Цена: <b>{close:.6g}</b> · Объём 24ч: <b>{_fmt_vol_short(vol_24h)}</b>\n"
                     f"Зона: {zone_low:.6g}–{zone_high:.6g} · До зоны: {dist:+.1f}%\n"
                     f"Надёжность: {zq}/10"
                 )
-                chart = build_inplay_digest_chart(sym, k1)
+                chart = build_inplay_digest_chart(sym, k1m) if k1m else None
                 if chart:
                     send_photo(chart, caption)
                 else:
@@ -5384,8 +5398,11 @@ def main():
 
     # Прокси
     refresh_proxies()
-    threading.Thread(target=lambda: [time.sleep(1800) or refresh_proxies()
-                                     for _ in iter(int, 1)], daemon=True).start()
+    def _proxy_refresh_loop():
+        while True:
+            time.sleep(1800)
+            refresh_proxies()
+    threading.Thread(target=_proxy_refresh_loop, daemon=True).start()
 
     # Список символов (обновляется каждые 5 мин)
     symbols_ref = [[]]
