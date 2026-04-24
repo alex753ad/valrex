@@ -576,7 +576,88 @@ def find_pivots(candles, tf_label, min_touches=2):
         levels.append({"price": price, "touches": touches, "type": "sup", "tf": tf_label})
     return levels
 
-def collect_levels(symbol, k1):
+def calc_max_candle_pct_8h(symbol: str) -> float:
+    """
+    Возвращает максимальный % размер тела 1m свечи за последние 8 часов.
+    Размер = (high - low) / open * 100.
+    """
+    k1_8h = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                  {"symbol": symbol, "interval": "1m", "limit": 480})
+    if not k1_8h:
+        return 0.0
+    max_pct = 0.0
+    for c in k1_8h:
+        o = float(c[1])
+        h = float(c[2])
+        l = float(c[3])
+        if o > 0:
+            pct = (h - l) / o * 100
+            if pct > max_pct:
+                max_pct = pct
+    return round(max_pct, 2)
+
+
+def collect_levels_15m_1h(symbol):
+    """
+    Строит уровни ТОЛЬКО по телам и теням 15-минутных и часовых свечей.
+    Возвращает два списка: levels_15m (жёлтые) и levels_1h (оранжевые).
+    """
+    k15 = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                {"symbol": symbol, "interval": "15m", "limit": 120})
+    k1h = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
+                {"symbol": symbol, "interval": "1h", "limit": 48})
+
+    def extract_levels(candles, tf_label, min_touches=2):
+        if not candles or len(candles) < 5:
+            return []
+        highs = [float(c[2]) for c in candles]
+        lows  = [float(c[3]) for c in candles]
+        opens = [float(c[1]) for c in candles]
+        closes= [float(c[4]) for c in candles]
+        pts   = []
+        wing  = 2
+        # Уровни по хаям (тени) и телам
+        for i in range(wing, len(candles) - wing):
+            # Тень — high
+            if highs[i] >= max(highs[i-wing:i] + highs[i+1:i+wing+1]):
+                pts.append(highs[i])
+            # Тело — max(open, close)
+            body_top = max(opens[i], closes[i])
+            if body_top >= max(max(opens[j], closes[j]) for j in range(i-wing, i+wing+1) if j != i):
+                pts.append(body_top)
+            # Тень — low
+            if lows[i] <= min(lows[i-wing:i] + lows[i+1:i+wing+1]):
+                pts.append(lows[i])
+            # Тело — min(open, close)
+            body_bot = min(opens[i], closes[i])
+            if body_bot <= min(min(opens[j], closes[j]) for j in range(i-wing, i+wing+1) if j != i):
+                pts.append(body_bot)
+
+        def cluster(pts_in, pct=0.3):
+            if not pts_in:
+                return []
+            pts_in = sorted(pts_in)
+            groups, g = [], [pts_in[0]]
+            for p in pts_in[1:]:
+                if (p - g[0]) / g[0] * 100 < pct:
+                    g.append(p)
+                else:
+                    groups.append(g); g = [p]
+            groups.append(g)
+            return [(sum(g)/len(g), len(g)) for g in groups if len(g) >= min_touches]
+
+        levels = []
+        for price, touches in cluster(pts):
+            ltype = "res" if price > float(candles[-1][4]) else "sup"
+            levels.append({"price": price, "touches": touches, "type": ltype, "tf": tf_label})
+        return levels
+
+    lvls_15m = extract_levels(k15, "15m", min_touches=2) if k15 else []
+    lvls_1h  = extract_levels(k1h, "1h",  min_touches=2) if k1h else []
+    return lvls_15m, lvls_1h
+
+
+
     pivot = find_pivots(k1[-100:], "1m")
     k5  = fetch(f"{BINANCE_BASE}/fapi/v1/klines", {"symbol": symbol, "interval": "5m",  "limit": 100})
     k15 = fetch(f"{BINANCE_BASE}/fapi/v1/klines", {"symbol": symbol, "interval": "15m", "limit": 100})
@@ -740,7 +821,9 @@ def draw_volume_profile(ax, candles, n_bins=40, alpha=0.25, poc_color="#ffd700")
 
 
 def build_chart(symbol, candles, levels=None, alert_type="inplay"):
-    """Универсальный график 1m. alert_type задаёт цвет заголовка."""
+    """Универсальный график 1m. alert_type задаёт цвет заголовка.
+    Уровни строятся только по 15m свечам (жёлтый) и 1h свечам (оранжевый).
+    """
     # FIX S1-5: fig объявлен заранее и закрывается в finally —
     # утечка памяти matplotlib при исключении во время отрисовки устранена
     fig = None
@@ -781,23 +864,26 @@ def build_chart(symbol, candles, levels=None, alert_type="inplay"):
         ax1.plot(range(n), vwap_vals, color="#ff9800", lw=1.2,
                  ls="--", alpha=0.85, label="VWAP", zorder=6)
 
-        if levels:
-            pmn, pmx = min(lows), max(highs)
-            margin = (pmx - pmn) * 0.15
-            visible = [lv for lv in levels if pmn-margin <= lv["price"] <= pmx+margin]
+        # ── Уровни: только 15m (жёлтый) и 1h (оранжевый) ──
+        pmn, pmx = min(lows), max(highs)
+        margin = (pmx - pmn) * 0.15
+        lvls_15m, lvls_1h = collect_levels_15m_1h(symbol)
+
+        def draw_levels(lvl_list, color, label_suffix, lw=1.4, ls="-"):
             seen, deduped = [], []
-            for lv in sorted(visible, key=lambda x: x["price"]):
-                if not any(abs(lv["price"]-s)/s*100 < 0.2 for s in seen):
-                    deduped.append(lv); seen.append(lv["price"])
-            for lv in deduped[:12]:
-                color = TF_COLORS.get(lv["type"], {}).get(lv["tf"], "#fff")
-                lw = 1.5 if lv["tf"] == "15m" else 1.0
-                ls = "-"  if lv["tf"] == "15m" else "--"
+            for lv in sorted(lvl_list, key=lambda x: x["price"]):
+                if pmn - margin <= lv["price"] <= pmx + margin:
+                    if not any(abs(lv["price"]-s)/s*100 < 0.2 for s in seen):
+                        deduped.append(lv); seen.append(lv["price"])
+            for lv in deduped[:10]:
                 ax1.axhline(y=lv["price"], color=color, lw=lw, ls=ls, alpha=0.9, zorder=5)
                 ax1.text(n-0.5, lv["price"],
-                         f" {lv['price']:.6g} [{lv['tf']}] ×{lv['touches']}",
+                         f" {lv['price']:.6g} [{label_suffix}] ×{lv['touches']}",
                          color=color, fontsize=7, va="center", fontweight="bold",
                          bbox=dict(facecolor="#0d1117", alpha=0.6, pad=1, edgecolor="none"))
+
+        draw_levels(lvls_15m, "#ffd700", "15m", lw=1.4, ls="-")   # жёлтый — 15m
+        draw_levels(lvls_1h,  "#ff8c00", "1h",  lw=1.8, ls="-")   # оранжевый — 1h
 
         ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: fmt_usd(x)))
         ticks = list(range(0, n, max(1, n//6)))
@@ -839,8 +925,8 @@ def build_chart(symbol, candles, levels=None, alert_type="inplay"):
                    edgecolor="#30363d", labelcolor="white", framealpha=0.7)
         title_color = CHART_TITLE_COLOR.get(alert_type, "#e6edf3")
         type_emoji  = ALERT_EMOJI.get(alert_type, "📊")
-        ax1.set_title(f"{type_emoji} {symbol} · 1m",
-                      color=title_color, fontsize=13, fontweight="bold", pad=8)
+        ax1.set_title(f"{type_emoji} {symbol} · 1m  |  🟡 15m уровни  🟠 1h уровни",
+                      color=title_color, fontsize=12, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
         ax2.set_ylabel("Vol USD",  color="#8b949e", fontsize=9)
         plt.tight_layout(pad=1.2)
@@ -976,7 +1062,7 @@ def build_layer1_alert(symbol, vol_mult_val, trigger):
 
 def build_layer3_alert(symbol, close, level, dist_pct, natr, vol_mult_val,
                        last_1m_vol_usd, cvd, pattern_name, trend, ob_pressure,
-                       touch_num, stars, mode, candles_count):
+                       touch_num, stars, mode, candles_count, max_candle_pct=0.0):
     coin  = symbol.replace("USDT", "")
     ltype = "поддержка" if level["type"] == "sup" else "сопротивление"
     div   = make_divider("inplay")
@@ -1006,6 +1092,7 @@ def build_layer3_alert(symbol, close, level, dist_pct, natr, vol_mult_val,
         f"Цена: <b>{close:.6g}</b> {squeeze_hint}",
         f"Уровень: <b>{level['price']:.6g}</b> [{level['tf']}] · расстояние: <b>{dist_pct}%</b> ({ltype})",
         f"Объём 1m: <b>{fmt_usd(last_1m_vol_usd)}</b> · спайк: <b>{vol_mult_val:.1f}x</b> от нормы",
+        f"Макс. свеча 8ч: <b>{max_candle_pct:.2f}%</b>",
         f"CVD: <b>{_cvd_str(cvd)}</b>",
         f"Стакан: <b>{_ob_str(ob_pressure)}</b>",
         f"Тренд 15m: <b>{_trend_str(trend)}</b>",
@@ -1022,10 +1109,11 @@ def build_layer3_alert(symbol, close, level, dist_pct, natr, vol_mult_val,
 #  ДЕДУПЛИКАЦИЯ АЛЕРТОВ
 # ─────────────────────────────────────────────
 
-def can_alert(symbol, touch_num, level_price=0, cooldown=60):
+def can_alert(symbol, touch_num, level_price=0, cooldown=120):
     """
     Дедупликация: один и тот же символ + уровень не шлётся чаще cooldown сек.
     При новом касании (touch_num меняется) — пропускаем сразу.
+    Cooldown увеличен до 120с для снижения дублей.
     """
     now = time.time()
     # Ключ: символ + округлённая цена уровня + номер касания
@@ -1435,7 +1523,8 @@ def layer3_evaluate(symbol, close, level, dist_pct, natr, mode,
     caption = build_layer3_alert(
         symbol, close, level, dist_pct, natr, vol_mult_val,
         last_1m_vol_usd, cvd, pattern_name, trend, ob_pressure,
-        touch_num, stars, mode, len(k1)
+        touch_num, stars, mode, len(k1),
+        max_candle_pct=calc_max_candle_pct_8h(symbol)
     )
 
     print(f"  [L3] 🎯 {symbol} | {mode} | касание {touch_num} | ⭐{stars} | dist={dist_pct}%")
@@ -2224,120 +2313,8 @@ def build_inplay_chart(symbol, k1, zone_low, zone_high, inner_levels,
             "zone_broken": "ЗОНА ПРОБИТА",
         }
         type_label = type_labels.get(alert_type, "ИНПЛЕЙ")
-        ax1.set_title(f"{symbol} · {type_label} · 1m",
-                      color=title_color, fontsize=13, fontweight="bold", pad=8)
-        ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
-        ax2.set_ylabel("Vol USD", color="#8b949e", fontsize=9)
-        plt.tight_layout(pad=1.2)
-        buf = io.BytesIO()
-        plt.savefig(buf, format="png", dpi=130, facecolor="#0d1117")
-        buf.seek(0)
-        return buf.read()
-
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 9),
-                                        gridspec_kw={"height_ratios": [3, 1]},
-                                        facecolor="#0d1117")
-        ax1.set_facecolor("#0d1117")
-        ax2.set_facecolor("#0d1117")
-        w = 0.6
-
-        for i in range(n):
-            color = "#26a69a" if closes[i] >= opens[i] else "#ef5350"
-            ax1.plot([i, i], [lows[i], highs[i]], color=color, lw=0.8)
-            bh = abs(closes[i]-opens[i]) or (highs[i]-lows[i])*0.01
-            ax1.add_patch(Rectangle((i-w/2, min(opens[i], closes[i])), w, bh,
-                                     facecolor=color, edgecolor=color))
-            ax2.bar(i, dvols[i], color=color, width=w, alpha=0.85)
-
-        # VWAP
-        vwap_vals = calc_vwap(data)
-        ax1.plot(range(n), vwap_vals, color="#ff9800", lw=1.2,
-                 ls="--", alpha=0.85, zorder=6)
-
-        # Зона входа — закрашенная область
-        ax1.axhspan(zone_low, zone_high, alpha=0.12, color="#ffd700", zorder=2)
-        ax1.axhline(y=zone_high, color="#ffd700", lw=2.0, ls="-",  zorder=6,
-                    label=f"Зона верх {zone_high:.6g}")
-        ax1.axhline(y=zone_low,  color="#ffd700", lw=2.0, ls="--", zorder=6,
-                    label=f"Зона низ {zone_low:.6g}")
-
-        # Пробитые уровни (стек) — текущей зоны
-        for lv in broken_levels:
-            if lv["price"] != zone_high and lv["price"] != zone_low:
-                ax1.axhline(y=lv["price"], color="#aaaaaa", lw=0.8, ls=":",
-                            alpha=0.6, zorder=4)
-                ax1.text(n-0.5, lv["price"],
-                         f" {lv['price']:.6g} [{lv['tf']}] {lv.get('hold_mins','?')}мин",
-                         color="#aaaaaa", fontsize=6, va="center")
-
-        # Все доп. зоны ниже текущей (поддержки для zone_broken)
-        pmn, pmx = min(lows), max(highs)
-        margin   = (pmx - pmn) * 0.25
-        below_all = sorted(
-            [lv for lv in broken_levels
-             if lv["price"] < zone_low * 0.999
-             and lv["price"] >= pmn - margin],
-            key=lambda x: x["price"], reverse=True
-        )
-        zone_colors_below = ["#26a69a", "#00bcd4", "#4fc3f7"]
-        for idx2, lv2 in enumerate(below_all[:3]):
-            c2 = zone_colors_below[min(idx2, 2)]
-            # Спан 0.3% вокруг уровня как мини-зона
-            spread = lv2["price"] * 0.003
-            ax1.axhspan(lv2["price"] - spread, lv2["price"] + spread,
-                        alpha=0.10, color=c2, zorder=2)
-            ax1.axhline(y=lv2["price"], color=c2, lw=1.2, ls="--",
-                        alpha=0.85, zorder=5)
-            ax1.text(n - 0.5, lv2["price"],
-                     f" {lv2['price']:.6g} [{lv2['tf']}] ×{lv2.get('touches','?')} {lv2.get('hold_mins','?')}мин",
-                     color=c2, fontsize=6, va="center",
-                     bbox=dict(facecolor="#0d1117", alpha=0.5, pad=1, edgecolor="none"))
-
-        # Внутренние уровни в зоне
-        for lv in inner_levels:
-            ax1.axhline(y=lv["price"], color="#ff8c00", lw=1.0, ls="--",
-                        alpha=0.8, zorder=5)
-            ax1.text(1, lv["price"],
-                     f" {lv['price']:.6g} [{lv['tf']}] слабый",
-                     color="#ff8c00", fontsize=6, va="center")
-
-        # Круглые числа в зоне
-        for r in round_nums:
-            ax1.axhline(y=r, color="#cc44ff", lw=0.8, ls=":",
-                        alpha=0.7, zorder=5)
-            ax1.text(3, r, f" {r:.6g} ○",
-                     color="#cc44ff", fontsize=6, va="center")
-
-        # Лимитки
-        limit_colors = ["#00ff88", "#00cc66", "#009944"]
-        for i, lm in enumerate(limits):
-            color = limit_colors[min(i, 2)]
-            ax1.axhline(y=lm["price"], color=color, lw=1.5, ls="-.",
-                        alpha=0.9, zorder=7)
-            ax1.text(n * 0.3, lm["price"],
-                     f" {lm['label']}: {lm['price']:.6g}",
-                     color=color, fontsize=7, va="bottom", fontweight="bold")
-
-        ax2.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x,_: fmt_usd(x)))
-        ticks = list(range(0, n, max(1, n//6)))
-        for ax in [ax1, ax2]:
-            ax.set_xticks(ticks)
-            ax.set_xticklabels([times[i].strftime("%H:%M") for i in ticks],
-                                color="#8b949e", fontsize=8)
-            ax.tick_params(colors="#8b949e", labelsize=8)
-            ax.yaxis.set_tick_params(labelcolor="#8b949e")
-            for sp in ax.spines.values(): sp.set_edgecolor("#30363d")
-            ax.grid(color="#21262d", ls="--", lw=0.5)
-            ax.set_xlim(-1, n)  # ← ДО volume profile
-
-        ax1.legend(loc="upper left", fontsize=7, facecolor="#161b22",
-                   edgecolor="#30363d", labelcolor="white", framealpha=0.8)
-
-        # Volume Profile
-        draw_volume_profile(ax1, data)
-
-        ax1.set_title(f"🟢 {symbol} · ИНПЛЕЙ · 1m",
-                      color=CHART_TITLE_COLOR["inplay"], fontsize=13, fontweight="bold", pad=8)
+        ax1.set_title(f"{symbol} · {type_label} · 1m  |  🟡 15m  🟠 1h",
+                      color=title_color, fontsize=12, fontweight="bold", pad=8)
         ax1.set_ylabel("Price", color="#8b949e", fontsize=9)
         ax2.set_ylabel("Vol USD", color="#8b949e", fontsize=9)
         plt.tight_layout(pad=1.2)
@@ -2391,7 +2368,7 @@ def build_inplay_alert(symbol, close, pump_pct, pump_mins,
     lines = [
         header,
         div,
-        f"Цена: <b>{close:.6g}</b>  NATR: {natr:.2f}%  Объём: {vol_mult_val:.1f}x",
+        f"Цена: <b>{close:.6g}</b>  NATR: {natr:.2f}%  Объём: {vol_mult_val:.1f}x  Макс.свеча 8ч: <b>{kwargs.get('max_candle_pct', 0.0):.2f}%</b>",
         "",
         f"📦 Зона: <b>{zone_low:.6g} – {zone_high:.6g}</b> ({zone_pct}%)",
         f"  ▲ <b>{zone_high:.6g}</b> [{broken_levels[-1]['tf'] if broken_levels else '?'}]"
@@ -2538,8 +2515,7 @@ def inplay_scan_symbol(symbol):
     body_clustered = cluster_body_levels(body_raw, tol_pct=0.20)
     # Добавляем кол-во заколов к каждому уровню
     for blv in body_clustered:
-        rej_count, _ = detect_wick_rejects(k1, blv["price"])
-        blv["wick_rejects"] = rej_count
+        blv["wick_rejects"] = detect_wick_rejects(k1, blv["price"])
     # Уровни в зоне и ниже — для лимиток и графика
     body_in_zone = [b for b in body_clustered
                     if zone_low * 0.995 <= b["price"] <= zone_high * 1.005]
@@ -2676,6 +2652,7 @@ def inplay_loop(symbols_ref):
                 # Алерт 1: новая инплей монета
                 if prev is None:
                     if can_inplay_alert(sym, "inplay", cooldown=300):
+                        _max_cp = calc_max_candle_pct_8h(sym)
                         caption = build_inplay_alert(
                             sym, close, data["pump_pct"], data["pump_mins"],
                             zone_low, zone_high, data["broken"],
@@ -2685,7 +2662,8 @@ def inplay_loop(symbols_ref):
                             data["oi_str"], data["oi_details"], data["peak_desc"],
                             data["zq_score"], data["zq_verdict"], data["rec_pct"], data["zq_flags"],
                             alert_type="inplay",
-                            body_in_zone=data.get("body_in_zone", [])
+                            body_in_zone=data.get("body_in_zone", []),
+                            max_candle_pct=_max_cp
                         )
                         chart = build_inplay_chart(
                             sym, data["k1"], zone_low, zone_high,
@@ -5312,7 +5290,10 @@ def hourly_inplay_digest():
         table_txt = _build_digest_table(table_rows)
         header = (
             f"📋 <b>Инплей дайджест</b> · {datetime.now().strftime('%H:%M')}\n"
-            f"Монет в наблюдении: <b>{len(snapshot)}</b>\n"
+            f"Монет в наблюдении: <b>{len(snapshot)}</b> "
+            f"(инплей: {sum(1 for v in snapshot.values() if v.get('_source','inplay')=='inplay')} · "
+            f"L1/L2: {sum(1 for v in snapshot.values() if v.get('_source','inplay')=='active')} · "
+            f"псевдо: {sum(1 for v in snapshot.values() if v.get('_source','inplay')=='pseudo')})\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"<pre>{table_txt}</pre>"
         )
