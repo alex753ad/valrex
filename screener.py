@@ -82,7 +82,7 @@ PSEUDO_OI_CHANGE    = 15.0     # % — если OI изменился меньш
 PSEUDO_TTL          = 3600     # 1 час монета в псевдопамп-наблюдении
 PSEUDO_SCAN_SEC     = 20       # интервал сканирования псевдопампов
 
-MAX_WORKERS         = 20
+MAX_WORKERS         = 8
 BINANCE_BASE        = "https://fapi.binance.com"
 
 # Слой 3 — минимальный рейтинг звёзд для алерта
@@ -346,8 +346,15 @@ def find_working_proxy():
     Ищет рабочий прокси. Приоритет:
       1. Webshare (платные, с авторизацией) — проверяем все по кругу
       2. Бесплатные из PROXY_LIST — как резерв
+    Если WEBSHARE_PROXIES не задан — работает напрямую без прокси.
     """
     global current_proxy
+
+    if not WEBSHARE_PROXIES:
+        with proxy_lock:
+            current_proxy = {"http": None, "https": None}
+        print("  [PROXY] ℹ️ WEBSHARE_PROXIES не задан, работаю напрямую")
+        return False
 
     # 1. Пробуем Webshare в случайном порядке
     shuffled = WEBSHARE_PROXIES[:]
@@ -363,34 +370,26 @@ def find_working_proxy():
             print(f"  [PROXY] ✅ Webshare: {ip_short}")
             return True
 
-    print("  [PROXY] ⚠️ Webshare недоступен, пробую резерв...")
-
-    # 2. Резервные бесплатные
-    for p in PROXY_LIST:
-        pd = {"http": f"http://{p}", "https": f"http://{p}"}
-        if test_proxy(pd):
-            with proxy_lock:
-                current_proxy = pd
-            print(f"  [PROXY] ✅ Резерв: {p}")
-            return True
-
-    print("  [PROXY] ❌ Рабочий прокси не найден, работаю напрямую")
+    print("  [PROXY] ⚠️ Webshare недоступен, работаю напрямую")
     with proxy_lock:
         current_proxy = {"http": None, "https": None}
     return False
 
 
 def refresh_proxies():
-    """Обновляет резервный список и переключает прокси."""
-    fetch_free_proxies()
+    """Обновляет прокси (только если Webshare задан)."""
+    if not WEBSHARE_PROXIES:
+        return
     find_working_proxy()
 
 
 def proxy_watchdog_loop():
     """
     Каждые 10 минут проверяет текущий прокси и переключает если упал.
-    Гарантирует что бот всегда идёт через Webshare.
+    Если WEBSHARE_PROXIES не задан — просто не запускается.
     """
+    if not WEBSHARE_PROXIES:
+        return
     import time as _time
     while True:
         _time.sleep(600)
