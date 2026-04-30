@@ -5396,8 +5396,11 @@ def main():
     threading.Thread(target=refresh_symbols, daemon=True).start()
     # Первая загрузка
     time.sleep(3)
+    print("  [SYM] Загружаю список символов...")
     symbols_ref[0] = get_all_symbols()
     print(f"  [SYM] Символов загружено: {len(symbols_ref[0])}")
+    if not symbols_ref[0]:
+        print("  [SYM] ERR Binance не отвечает или заблокировал IP Railway!")
 
     # Монитор рыночного контекста BTC/ETH (обновляется каждые 2 мин)
     threading.Thread(target=market_context_loop, daemon=True).start()
