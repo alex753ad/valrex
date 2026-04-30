@@ -309,11 +309,14 @@ def _webshare_to_proxy_dict(entry: str) -> dict | None:
 
 
 def test_proxy(proxy_dict: dict) -> bool:
-    """Проверяет прокси-запросом к Binance."""
+    """Проверяет прокси реальным запросом к Binance klines."""
     try:
-        r = requests.get(f"{BINANCE_BASE}/fapi/v1/ping",
-                         proxies=proxy_dict, timeout=6)
-        return r.status_code == 200
+        r = requests.get(
+            f"{BINANCE_BASE}/fapi/v1/klines",
+            params={"symbol": "BTCUSDT", "interval": "1m", "limit": "1"},
+            proxies=proxy_dict, timeout=8
+        )
+        return r.status_code == 200 and len(r.json()) > 0
     except Exception:
         return False
 
@@ -344,57 +347,52 @@ def fetch_free_proxies():
 def find_working_proxy():
     """
     Ищет рабочий прокси. Приоритет:
-      1. Webshare (платные) — если задан WEBSHARE_PROXIES
-      2. Бесплатные из PROXY_LIST — резерв
-      3. Напрямую — если ничего не нашли
+      1. Webshare (платные, с авторизацией) — проверяем все по кругу
+      2. Бесплатные из PROXY_LIST — как резерв
+    Если WEBSHARE_PROXIES не задан — работает напрямую без прокси.
     """
     global current_proxy
 
-    # 1. Пробуем Webshare
-    if WEBSHARE_PROXIES:
-        shuffled = WEBSHARE_PROXIES[:]
-        random.shuffle(shuffled)
-        for entry in shuffled:
-            pd = _webshare_to_proxy_dict(entry)
-            if pd is None:
-                continue
-            if test_proxy(pd):
-                with proxy_lock:
-                    current_proxy = pd
-                ip_short = entry.split(":")[0]
-                print(f"  [PROXY] ✅ Webshare: {ip_short}")
-                return True
-        print("  [PROXY] ⚠️ Webshare недоступен, пробую бесплатные...")
+    if not WEBSHARE_PROXIES:
+        with proxy_lock:
+            current_proxy = {"http": None, "https": None}
+        print("  [PROXY] ℹ️ WEBSHARE_PROXIES не задан, работаю напрямую")
+        return False
 
-    # 2. Пробуем бесплатные прокси
-    if not PROXY_LIST:
-        fetch_free_proxies()
-
-    pool = PROXY_LIST[:]
-    random.shuffle(pool)
-    for p in pool:
-        pd = {"http": f"http://{p}", "https": f"http://{p}"}
+    # 1. Пробуем Webshare в случайном порядке
+    shuffled = WEBSHARE_PROXIES[:]
+    random.shuffle(shuffled)
+    for entry in shuffled:
+        pd = _webshare_to_proxy_dict(entry)
+        if pd is None:
+            continue
         if test_proxy(pd):
             with proxy_lock:
                 current_proxy = pd
-            print(f"  [PROXY] ✅ Бесплатный: {p}")
+            ip_short = entry.split(":")[0]
+            print(f"  [PROXY] ✅ Webshare: {ip_short}")
             return True
 
-    # 3. Напрямую
-    print("  [PROXY] ❌ Рабочий прокси не найден, работаю напрямую")
+    print("  [PROXY] ⚠️ Webshare недоступен, работаю напрямую")
     with proxy_lock:
         current_proxy = {"http": None, "https": None}
     return False
 
 
 def refresh_proxies():
-    """Обновляет список бесплатных прокси и переключает."""
-    fetch_free_proxies()
+    """Обновляет прокси (только если Webshare задан)."""
+    if not WEBSHARE_PROXIES:
+        return
     find_working_proxy()
 
 
 def proxy_watchdog_loop():
-    """Каждые 10 минут проверяет прокси и переключает если упал."""
+    """
+    Каждые 10 минут проверяет текущий прокси и переключает если упал.
+    Если WEBSHARE_PROXIES не задан — просто не запускается.
+    """
+    if not WEBSHARE_PROXIES:
+        return
     import time as _time
     while True:
         _time.sleep(600)
