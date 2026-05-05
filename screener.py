@@ -5278,6 +5278,22 @@ def hourly_inplay_digest():
                 natr_val = state.get("natr", calc_natr(k1m) if k1m else 1.0)
                 source   = state.get("_source", "inplay")
 
+                # Для L1/L2 и псевдо монет зона не считалась при добавлении —
+                # пробуем посчитать её сейчас через inplay_scan_symbol
+                if source in ("active", "pseudo") and not state.get("zone_high"):
+                    try:
+                        ip_data = inplay_scan_symbol(sym)
+                        if ip_data:
+                            state = {**state,
+                                     "zone_high": ip_data["zone_high"],
+                                     "zone_low":  ip_data["zone_low"],
+                                     "zq_score":  ip_data["zq_score"]}
+                            print(f"  [DIGEST] зона для {sym} ({source}): "
+                                  f"{ip_data['zone_low']:.6g}–{ip_data['zone_high']:.6g} "
+                                  f"ZQ={ip_data['zq_score']}")
+                    except Exception as _ze:
+                        print(f"  [DIGEST ZONE {sym}] {_ze}")
+
                 table_rows.append({
                     "ticker":    sym.replace("USDT", ""),
                     "chg_today": day_chg,
