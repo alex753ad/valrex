@@ -5252,10 +5252,18 @@ def hourly_inplay_digest():
                 k1d = fetch(f"{BINANCE_BASE}/fapi/v1/klines",
                             {"symbol": sym, "interval": "1d", "limit": 2})
 
-                close     = float(k1m[-1][4]) if k1m else 0
-                day_open  = float(k1d[0][1]) if k1d and len(k1d) >= 1 else close
+                # Пропускаем монету если данные не пришли — не показываем нули
+                if not k1m or not k1d:
+                    print(f"  [DIGEST SKIP {sym}] нет klines данных")
+                    continue
+                close = float(k1m[-1][4])
+                if close <= 0:
+                    print(f"  [DIGEST SKIP {sym}] close=0, монета неактивна")
+                    continue
+                day_open  = float(k1d[0][1]) if len(k1d) >= 1 else close
                 day_chg   = (close - day_open) / day_open * 100 if day_open > 0 else 0
-                vol_24h   = float(k1d[-1][7]) if k1d else 0
+                # index [7] = quoteAssetVolume (USD для USDT-пар) — правильный объём
+                vol_24h   = float(k1d[-1][7])
 
                 # RANGE 1m/5: размах последних 5 однаминутных свечей как % от цены
                 if k1m and len(k1m) >= 5:
@@ -5317,11 +5325,23 @@ def hourly_inplay_digest():
                 vol_24h  = d["vol_24h"]
 
                 # FIX B-03: было data.get('_source') — исправлено на state.get
-                source   = state.get("_source", "inplay")
+                source    = state.get("_source", "inplay")
                 zone_high = state.get("zone_high", 0)
                 zone_low  = state.get("zone_low", 0)
-                dist = (close - zone_high) / zone_high * 100 if zone_high else 0
-                zq   = state.get("zq_score", "?")
+                zq        = state.get("zq_score")  # None если нет (active/pseudo не считают ZQ)
+
+                # Дистанция до зоны — только если зона реально есть
+                if zone_high and zone_low:
+                    dist     = (close - zone_high) / zone_high * 100
+                    zone_str = f"Зона: {zone_low:.6g}–{zone_high:.6g} · До зоны: {dist:+.1f}%"
+                else:
+                    zone_str = "Зона: нет данных"
+
+                # Надёжность — только для inplay монет с ZQ-скором
+                if zq is not None:
+                    zq_str = f"Надёжность: {zq}/10"
+                else:
+                    zq_str = "Надёжность: н/д"
 
                 natr_m     = natr_mode(natr_val)
                 mode_tag   = {"WILD": "⚡ WILD", "HOT": "🔥 HOT", "NORMAL": "✅ NORMAL"}.get(natr_m, natr_m)
@@ -5331,8 +5351,8 @@ def hourly_inplay_digest():
                 caption = (
                     f"<code>{sym}</code> · {day_chg:+.1f}% за день · {source_tag} · {mode_tag} (NATR {natr_val:.1f}%)\n"
                     f"Цена: <b>{close:.6g}</b> · Объём 24ч: <b>{_fmt_vol_short(vol_24h)}</b>\n"
-                    f"Зона: {zone_low:.6g}–{zone_high:.6g} · До зоны: {dist:+.1f}%\n"
-                    f"Надёжность: {zq}/10"
+                    f"{zone_str}\n"
+                    f"{zq_str}"
                 )
                 chart = build_inplay_digest_chart(sym, k1m) if k1m else None
                 if chart:
